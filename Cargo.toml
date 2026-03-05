@@ -1,0 +1,21 @@
+[package]
+name = "cryptcrypt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm-siv = "0.11.1"
+argon2 = "0.5.3"
+chacha20poly1305 = "0.10.1"
+clap = { version = "4.5.60", features = ["derive"] }
+hkdf = "0.12.4"
+rand = "0.10.0"
+rand_chacha = "0.10.0"
+rpassword = "7.4.0"
+sha2 = "0.10.9"
+typenum = "1.19.0"
+zeroize = "1.8.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
