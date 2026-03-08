@@ -9,6 +9,7 @@ argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.60", features = ["derive"] }
 hkdf = "0.12.4"
+num_cpus = "1.17.0"
 rand = "0.10.0"
 rand_chacha = "0.10.0"
 rpassword = "7.4.0"
