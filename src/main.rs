@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::error::Error;
+use std::path::PathBuf;
+use std::thread;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::{Rng, SeedableRng};
@@ -16,10 +18,9 @@ use clap::Parser;
 use rpassword::prompt_password;
 use hkdf::Hkdf;
 use sha2::Sha256;
-use std::thread;
 
 
-const ENCRYPTED_FILE_EXT: &str = ".cce";
+const ENCRYPTED_FILE_EXT: &str = "cce";
 const CHUNK_SIZE:     usize = 1024 * 1024;
 const PW_SALT_SIZE:   usize = 32; 
 const KEY_SIZE:       usize = 32; 
@@ -28,6 +29,8 @@ const AES_TAG_SIZE:   usize = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;
 const CHA_NONCE_SIZE: usize = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; 
 const CHA_TAG_SIZE:   usize = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;
 const HKDF_INFO_SIZE: usize = 12; 
+
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 
 /// Program for encryption and decryption of a file. 
@@ -40,7 +43,7 @@ struct Args {
     decrypt: bool,
 
     /// File that should be encrypted or decrypted
-    file: String,
+    file: PathBuf,
 }
 
 /// Main entry point for the cryptcrypt application.
@@ -51,15 +54,15 @@ struct Args {
 /// # Returns
 /// - `Ok(())` on successful completion
 /// - `Err` if an error occurs during encryption/decryption
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     let args = Args::parse();
 
-    let filename_in = args.file;
+    let filepath = args.file;
 
     if args.decrypt {
-       Decryption.decrypt(filename_in)?;
+       Decryption.decrypt(&filepath)?;
     } else {
-       Encryption.encrypt(filename_in)?;
+       Encryption.encrypt(&filepath)?;
     }
 
     Ok(())
@@ -78,7 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// # Returns
 /// - `Ok(password)` containing the user's password
 /// - `Err` if passwords don't match (when verify=true) or on I/O error
-fn get_password_from_user(verify: bool) -> Result<String, Box<dyn Error>> {
+fn get_password_from_user(verify: bool) -> Result<String> {
     if cfg!(test) {
         println!("!!! Test-password used !!!");
         return Ok("abc123test".to_string())
@@ -114,7 +117,7 @@ fn get_password_from_user(verify: bool) -> Result<String, Box<dyn Error>> {
 /// # Returns
 /// - `Ok(())` on successful key derivation
 /// - `Err` if PRK length is invalid or requested output length is invalid
-fn key_derivation(key: &[u8], info: &[u8], okm: &mut [u8]) -> Result<(), Box<dyn Error>> {
+fn key_derivation(key: &[u8], info: &[u8], okm: &mut [u8]) -> Result<()> {
     let hk = Hkdf::<Sha256>::from_prk(key)
         .map_err(|e| format!("Invalid PRK length for HKDF: {:?}", e))?;
     hk.expand(info, okm)
@@ -139,10 +142,10 @@ fn key_derivation(key: &[u8], info: &[u8], okm: &mut [u8]) -> Result<(), Box<dyn
 /// # Returns
 /// - `Ok(())` on successful completion
 /// - `Err` if file I/O fails or cryptographic functions fail
-fn crypt_io(mut f_in: File, mut f_out: File, chunk_size: usize, key: Zeroizing<[u8; 32]>, 
-    crypt_fn1: fn(&[u8], &[u8]) -> Result<Vec<u8>, Box<dyn Error>>,
-    crypt_fn2: fn(&[u8], &[u8]) -> Result<Vec<u8>, Box<dyn Error>>) 
-    -> Result<(), Box<dyn Error>> 
+fn crypt_io(mut f_in: File, mut f_out: File, chunk_size: usize, key: &Zeroizing<[u8; 32]>, 
+    crypt_fn1: fn(&[u8], &[u8]) -> Result<Vec<u8>>,
+    crypt_fn2: fn(&[u8], &[u8]) -> Result<Vec<u8>>) 
+    -> Result<()> 
 {
     let cpu_count = num_cpus::get();
        
@@ -196,7 +199,7 @@ impl Encryption {
     /// # Returns
     /// - `Ok((pw_salt, key))` containing the salt and derived key
     /// - `Err` if password hashing fails
-    fn hash_password(&self) -> Result<([u8; PW_SALT_SIZE], [u8; KEY_SIZE]), Box<dyn Error>> {
+    fn hash_password(&self) -> Result<([u8; PW_SALT_SIZE], [u8; KEY_SIZE])> {
         // create random salt
         let mut pw_salt = [0u8; PW_SALT_SIZE];
         let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng)?;
@@ -223,7 +226,7 @@ impl Encryption {
     /// # Returns
     /// - `Ok(encrypted_data)` containing nonce + ciphertext + authentication tag
     /// - `Err` if initialization or encryption fails
-    fn cha_encrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn cha_encrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(key)
             .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
         let nonce = XChaCha20Poly1305::generate_nonce(OsRng);
@@ -246,7 +249,7 @@ impl Encryption {
     /// # Returns
     /// - `Ok(encrypted_data)` containing info + nonce + ciphertext + authentication tag
     /// - `Err` if key derivation or encryption fails
-    fn aes_encrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn aes_encrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>> {
         // key derivation
         let mut info = [0u8; HKDF_INFO_SIZE];
         let mut okm = Zeroizing::new([0u8; KEY_SIZE]); // output key material
@@ -270,16 +273,17 @@ impl Encryption {
     /// the file in chunks across multiple threads. Output file gets `.cce` extension.
     ///
     /// # Arguments
-    /// - `filename_in`: Path to input file to encrypt
+    /// - `filepath_in`: Path to input file to encrypt
     ///
     /// # Returns
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
-    fn encrypt(&self, filename_in: String) -> Result<(), Box<dyn Error>> {
-        let filename_out = filename_in.clone() + ENCRYPTED_FILE_EXT;
+    fn encrypt(&self, filepath_in: &PathBuf) -> Result<()> {
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
     
-        let f_in  = File::open(filename_in)?;
-        let mut f_out = File::create(filename_out)?;
+        let f_in  = File::open(filepath_in)?;
+        let mut f_out = File::create(filepath_out)?;
 
         let mut key = Zeroizing::new([0u8; KEY_SIZE]);
         let pw_salt;
@@ -288,7 +292,10 @@ impl Encryption {
         // write password salt to file at first
         f_out.write_all(&pw_salt)?;
 
-        crypt_io(f_in, f_out, CHUNK_SIZE, key, Self::cha_encrypt_buffer, Self::aes_encrypt_buffer)?;
+        crypt_io(f_in, f_out, CHUNK_SIZE, &key, 
+            Self::cha_encrypt_buffer, 
+            Self::aes_encrypt_buffer
+        )?;
 
         Ok(())
     }
@@ -312,7 +319,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(key)` containing the derived key
     /// - `Err` if password hashing fails
-    fn hash_password(&self, pw_salt: &[u8]) -> Result<[u8; KEY_SIZE], Box<dyn Error>> {
+    fn hash_password(&self, pw_salt: &[u8]) -> Result<[u8; KEY_SIZE]> {
         let mut password = get_password_from_user(false)?;
         let mut key = Zeroizing::new([0u8; KEY_SIZE]);
         Argon2::default().hash_password_into(password.as_bytes(), pw_salt, key.as_mut())
@@ -334,7 +341,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(plaintext)` containing decrypted data
     /// - `Err` if decryption fails or authentication tag verification fails
-    fn cha_decrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn cha_decrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(key)
             .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
         let nonce = XNonce::from_slice(&buf[..CHA_NONCE_SIZE]);
@@ -356,7 +363,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(plaintext)` containing decrypted data
     /// - `Err` if key derivation fails or decryption/authentication fails
-    fn aes_decrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    fn aes_decrypt_buffer(key: &[u8], buf: &[u8]) -> Result<Vec<u8>> {
         let info = &buf[..HKDF_INFO_SIZE];
         let nonce = &buf[HKDF_INFO_SIZE..(HKDF_INFO_SIZE + AES_NONCE_SIZE)]; 
         let encrypted_data= &buf[(HKDF_INFO_SIZE + AES_NONCE_SIZE)..]; 
@@ -379,21 +386,22 @@ impl Decryption {
     /// and decrypts the file in chunks across multiple threads. Output file has `.cce` suffix removed.
     ///
     /// # Arguments
-    /// - `filename_in`: Path to encrypted input file (must end with `.cce`)
+    /// - `filepath_in`: Path to encrypted input file (must end with `.cce`)
     ///
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    fn decrypt(&self, filename_in: String) -> Result<(), Box<dyn Error>> {
-        let mut filename_out = filename_in.clone();
-        if filename_in.ends_with(ENCRYPTED_FILE_EXT) {
-            filename_out.replace_range((filename_in.len() - ENCRYPTED_FILE_EXT.len()).., "");
+    fn decrypt(&self, filepath_in: &PathBuf) -> Result<()> {
+        let mut filepath_out = filepath_in.clone();
+        if filepath_in.extension() == Some(std::ffi::OsStr::new(ENCRYPTED_FILE_EXT)) {
+            // remove encrypted-file-extension
+            filepath_out.set_extension("");
         } else {
-            return Err(format!("Invalid filename, it does not end with {ENCRYPTED_FILE_EXT}").into())
+            return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT}").into())
         }
 
-        let mut f_in  = File::open(filename_in)?;
-        let f_out = File::create(filename_out)?;
+        let mut f_in  = File::open(filepath_in)?;
+        let f_out = File::create(filepath_out)?;
 
         let mut pw_salt = [0u8; PW_SALT_SIZE];
         f_in.read_exact(&mut pw_salt)?;
@@ -404,7 +412,7 @@ impl Decryption {
             f_in, 
             f_out, 
             CHUNK_SIZE + HKDF_INFO_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE, 
-            key,
+            &key,
             Self::aes_decrypt_buffer, 
             Self::cha_decrypt_buffer
         )?;
@@ -494,35 +502,43 @@ mod tests {
     #[test]
     fn test_crypt() {
         // create file with random data for encryption
-        let filename = "test_cc.bin";
+        let filepath_in = PathBuf::from("test_cc.bin");
+        let mut filepath_org = filepath_in.clone();
+        filepath_org.add_extension("org");
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        
         let mut data = vec![0; 1024 * 3000];
         rand::rng().fill_bytes(&mut data);
-        std::fs::write(filename, &data).unwrap();
+        std::fs::write(&filepath_in, &data).unwrap();
 
         assert_eq!(get_password_from_user(false).unwrap(), "abc123test");
 
         // encrypt, backup original file, decrypt
-        Encryption.encrypt(filename.to_string()).unwrap();
-        std::fs::rename(filename, filename.to_string() + ".org").unwrap();
-        Decryption.decrypt(filename.to_string() + ENCRYPTED_FILE_EXT).unwrap();
+        Encryption.encrypt(&filepath_in).unwrap();
+        std::fs::rename(&filepath_in, &filepath_org).unwrap();
+        Decryption.decrypt(&filepath_out).unwrap();
 
         // read and compare decrypted file against backup
-        let decrypt_data = std::fs::read(filename).unwrap();
+        let decrypt_data = std::fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // cleanup
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file(filename.to_string() + ENCRYPTED_FILE_EXT);
-        let _ = std::fs::remove_file(filename.to_string() + ".org");
+        let _ = std::fs::remove_file(&filepath_in);
+        let _ = std::fs::remove_file(&filepath_out);
+        let _ = std::fs::remove_file(&filepath_org);
     }
 
     #[test]
-    #[ignore]
+    #[ignore="only for benchmarking"]
     fn test_crypt_bench() {
-        let filename = "ttt";         
+        // a file 'ttt' must already exist
+        let filepath_in = PathBuf::from("ttt");     
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
 
-        Encryption.encrypt(filename.to_string()).unwrap();
-        Decryption.decrypt(filename.to_string() + ENCRYPTED_FILE_EXT).unwrap();
+        Encryption.encrypt(&filepath_in).unwrap();
+        Decryption.decrypt(&filepath_out).unwrap();
     }
 
 }
