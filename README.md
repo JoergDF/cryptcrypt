@@ -1,4 +1,4 @@
-# CryptCrypt
+# cryptcrypt
 
 A command-line tool for encrypting and decrypting a file using modern encryption algorithms and password-based key derivation.
 
@@ -63,10 +63,10 @@ cargo run --release
 
 ## Encryption details
 
-1. Derive encryption key from password using Argon2id with a 32-byte random salt. Write the salt to the start of the encrypted file.
+1. Derive encryption key from password using Argon2id with a random salt. Write the salt to the start of the encrypted file.
 2. Read a 1 MByte chunk from the input file.
-3. Encrypt chunk with [XChaCha20Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using the key from step 1 and a random 24-byte nonce. Place the nonce before the encrypted data.
-4. Encrypt the result from step 3 with [AES-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) with a new key derived from step 1's key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) and a random 12-byte HKDF-info. Use a random 12-byte nonce with AES-GCM-SIV. Place both the HKDF-info and nonce before the encrypted data.
+3. Encrypt chunk with [XChaCha20Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using the key from step 1 and a random nonce. Place the nonce before the encrypted data.
+4. Encrypt the result from step 3 with [AES-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a random nonce and a new key derived from step 1's key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) and a random HKDF-info. Place both the HKDF-info and nonce before the encrypted data.
 5. Write the encrypted result to the output file.
 6. Repeat steps 2–5 until all input data is encrypted.
 
