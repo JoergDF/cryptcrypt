@@ -31,7 +31,7 @@ Options:
 	-V, --version  Print version
 ```
 
-### Building/Run from Source
+### Build/Run from Source
 
 ```
 git clone https://github.com/JoergDF/cryptcrypt.git
