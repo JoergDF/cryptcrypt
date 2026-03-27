@@ -1,6 +1,9 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
 
 env:
@@ -13,8 +16,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-       # os: [macos-26-intel, macos-latest, ubuntu-latest, , ubuntu-24.04-arm, windows-latest, windows-11-arm]
-       os: [ubuntu-latest, ubuntu-24.04-arm]
+       os: [macos-26-intel, macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -24,11 +26,19 @@ jobs:
       - name: Get cargo version
         run: cargo --version --verbose
       - name: Build
-        run: cargo build -release
-      - name: Zip
-        run: tar -a -cf cryptcrypt_${{ runner.os }}_${{ runner.arch }}.zip target/release/cryptcrypt
+        run: cargo build --release
+      - name: Prepare Test (Windows)
+        if: runner.os == 'Windows'
+        # wexpect needs pkg_resources, therefore older setuptools (which still contains it) required
+        run: pip install setuptools==81.0.0 wexpect
+      - name: Prepare Test (macOS)
+        if: runner.os == 'macOS'
+        run: pip install pexpect
+      - name: Test
+        run: python .github/workflows/test_release.py
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: Binary for ${{ runner.os }} ${{ runner.arch }}
-          path: cryptcrypt_${{ runner.os }}_${{ runner.arch }}.zip
+          name: cryptcrypt_${{ runner.os }}_${{ runner.arch }}
+          path: target/release/cryptcrypt${{ runner.os == 'Windows' && '.exe' || '' }}
+          compression-level: 0

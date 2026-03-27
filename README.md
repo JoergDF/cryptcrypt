@@ -41,13 +41,10 @@ cargo run --release
 
 ### Examples
 
-- Show help:
-  ```
-  cargo r -r -- --help
-  ```
-
 - Encrypt a file:
   ```
+  cryptcrypt file.bin
+  or
   cargo r -r -- file.bin
   ```
   Prompts you to enter a password (with confirmation).  
@@ -55,6 +52,8 @@ cargo run --release
 
 - Decrypt a file:
   ```
+  cryptcrypt -d file.bin.cce
+  or
   cargo r -r -- -d file.bin.cce
   ```
   Prompts you to enter a password.  
