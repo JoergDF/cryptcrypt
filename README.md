@@ -8,6 +8,7 @@ A command-line tool for encrypting and decrypting a file using modern encryption
 
 - Dual encryption with ciphers AES-GCM-SIV and XChaCha20Poly1305
 - Password-based key derivation (Argon2id)
+- Optional key file can be used additionally to the password
 - Handles large files efficiently by parallel processing them in chunks
 - CLI interface
 - Rust toolchain
@@ -18,17 +19,19 @@ A command-line tool for encrypting and decrypting a file using modern encryption
 
 ```
 Program for encryption and decryption of a file. 
-If no option is given, the file is encrypted.
+If no option is given, file is encrypted.
 
 Usage: cryptcrypt [OPTIONS] <FILE>
 
 Arguments:
-	<FILE>  File that should be encrypted or decrypted
+  <FILE>  File that should be encrypted or decrypted
 
 Options:
-	-d, --decrypt  Decrypt file
-	-h, --help     Print help
-	-V, --version  Print version
+  -d, --decrypt            Decrypt file
+  -k, --keyfile <KEYFILE>  Additional key file to supplement the password
+  -h, --help               Print help
+  -V, --version            Print version
+
 ```
 
 ### Build/Run from Source
@@ -44,30 +47,39 @@ cargo run --release
 - Encrypt a file:
   ```
   cryptcrypt file.bin
-  or
-  cargo r -r -- file.bin
   ```
   Prompts you to enter a password (with confirmation).  
   Creates output file `file.bin.cce`. Overwrites file, if it already exists.
 
+- Encrypt a file with additional key file:
+  ```
+  cryptcrypt -k keyfile.bin file.bin
+  ```
+
 - Decrypt a file:
   ```
   cryptcrypt -d file.bin.cce
-  or
-  cargo r -r -- -d file.bin.cce
   ```
   Prompts you to enter a password.  
   Creates output file `file.bin`. Overwrites file, if it already exists.
 
+- Decrypt a file with additional key file:
+  ```
+  cryptcrypt -k keyfile.bin -d file.bin.cce
+  ```
 
 ## Encryption details
 
-1. Derive encryption key from password using Argon2id with a random salt. Write the salt to the start of the encrypted file.
-2. Read a 1 MByte chunk from the input file.
-3. Encrypt chunk with [XChaCha20Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using the key from step 1 and a random nonce. Place the nonce before the encrypted data.
-4. Encrypt the result from step 3 with [AES-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a random nonce and a new key derived from step 1's key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) and a random HKDF-info. Place both the HKDF-info and nonce before the encrypted data.
-5. Write the encrypted result to the output file.
-6. Repeat steps 2–5 until all input data is encrypted.
+1. If a key file is used, hash its first 64MB (at maximum) with sha3-512.
+2. Derive encryption key from password and the optional key file hash using Argon2id with a random salt. Write the salt to the start of the encrypted file.
+3. Read a 1 MByte chunk from the input file.
+4. Encrypt chunk with [XChaCha20Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using 
+the key from step 2 and a random nonce. Place the nonce before the encrypted data.
+5. Encrypt the result from step 4 with [AES-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a random nonce and 
+a new key derived from step 1's key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) and a random HKDF-info. 
+Place both the HKDF-info and nonce before the encrypted data.
+6. Write the encrypted result to the output file.
+7. Repeat steps 3–6 until all input data is encrypted.
 
 
 ## License
