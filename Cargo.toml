@@ -13,9 +13,10 @@ num_cpus = "1.17.0"
 rand = "0.10.0"
 rand_chacha = "0.10.0"
 rpassword = "7.4.0"
+secrecy = "0.10.3"
 sha2 = "0.10.9"
+sha3 = "0.10.8"
 typenum = "1.19.0"
-zeroize = "1.8.2"
 
 [profile.release]
 lto = "thin"
