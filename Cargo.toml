@@ -1,6 +1,6 @@
 [package]
 name = "cryptcrypt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,14 +8,14 @@ aes-gcm-siv = "0.11.1"
 argon2 = "0.5.3"
 chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.60", features = ["derive"] }
-hkdf = "0.12.4"
+hkdf = "0.13.0"
 num_cpus = "1.17.0"
 rand = "0.10.0"
 rand_chacha = "0.10.0"
 rpassword = "7.4.0"
 secrecy = "0.10.3"
-sha2 = "0.10.9"
-sha3 = "0.10.8"
+sha2 = "0.11.0"
+sha3 = "0.11.0"
 typenum = "1.19.0"
 
 [profile.release]
