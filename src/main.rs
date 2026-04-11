@@ -17,33 +17,20 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
+use bzip2::Compression;
+use bzip2::read::{BzEncoder, BzDecoder};
 
 
+const FILE_FORMAT_VERSION: u8   = 3;
 const ENCRYPTED_FILE_EXT: &str  = "cce";
-const CHUNK_SIZE: usize         = 1_048_576; // 1024 * 1024 bytes
+const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
 const MAX_KEYFILE_CHUNKS: usize = 64;
 const SALT_SIZE: usize          = 32; 
 const KEY_SIZE: usize           = 32; 
 const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USIZE; // 12 bytes
-const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;   // 16 bytes
 const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
-const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;   // 16 bytes
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
-
-/// Parameters for file I/O operations during cryptographic processing.
-///
-/// Reduces function signature complexity.
-struct FileParams {
-    /// Input file to read data from
-    f_in: File, 
-    /// Output file to write processed data to
-    f_out: File,
-    /// Total size in bytes of input data remaining to be read
-    f_in_size: u64, 
-    /// Size in bytes of each chunk to process per iteration
-    chunk_size: usize,
-}
 
 
 /// Program for encryption and decryption of a file. 
@@ -59,9 +46,14 @@ struct Args {
     #[arg(short, long)]
     keyfile: Option<PathBuf>,
 
+    /// Compress data before encryption, automatically detected on decryption
+    #[arg(short = 'z', long, default_value_t = false)]
+    compress: bool,
+
     /// File that should be encrypted or decrypted
     file: PathBuf,
 }
+/// COmpressed status
 
 /// Main entry point for the cryptcrypt application.
 ///
@@ -76,11 +68,11 @@ fn main() -> Result<()> {
 
     let filepath = args.file;
     let keyfilepath = args.keyfile;
-
+    
     if args.decrypt {
        Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
     } else {
-       Encryption::encrypt(&filepath, keyfilepath.as_ref())?;
+       Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress)?;
     }
 
     Ok(())
@@ -211,73 +203,99 @@ fn key_derivation(key: &SecretSlice<u8>, salt: &[u8], info: &[u8]) -> Result<Sec
     Ok(okm)
 }
 
+/// Parameters for file operations during cryptographic processing.
+struct CryptIo {
+    /// Input file to read data from
+    f_in: File, 
+    /// Output file to write processed data to
+    f_out: File,
+    /// Total size in bytes of input data remaining to be read
+    f_in_size: u64, 
+    /// Size in bytes of each chunk to process per iteration
+    chunk_size: usize,
+    /// Compress data before encryption
+    compress: bool,
+}
 
-/// Performs cryptographic I/O operations on a file using chunked processing with multithreading.
-///
-/// Reads input file in chunks, applies two sequential cryptographic functions to each chunk
-/// using parallelism by threads and writes the results.
-///
-/// # Arguments
-/// - `fp`: file parameters
-/// - `key1`: Cryptographic key for processing with first cryptographic function
-/// - `key2`: Cryptographic key for processing with second cryptographic function
-/// - `crypt_fn1`: First cryptographic function (e.g., first-pass encryption)
-/// - `crypt_fn2`: Second cryptographic function (e.g., second-pass encryption)
-///
-/// # Returns
-/// - `Ok(())` on successful completion
-/// - `Err` if file I/O fails or cryptographic functions fail
-#[allow(clippy::type_complexity)]
-fn crypt_io(
-    fp: &mut FileParams,
-    key1: &SecretSlice<u8>, 
-    key2: &SecretSlice<u8>,
-    crypt_fn1: fn(&SecretSlice<u8>, &[u8], u32, bool) -> Result<Vec<u8>>,
-    crypt_fn2: fn(&SecretSlice<u8>, &[u8], u32, bool) -> Result<Vec<u8>>
-) -> Result<()> 
-{
-    let cpu_count = num_cpus::get();
-    let mut chunk_count: u32 = 0;
-    let mut file_remaining = fp.f_in_size;    
+impl CryptIo {
+    /// Performs cryptographic I/O operations on a file using chunked processing with multithreading.
+    ///
+    /// Reads input file in chunks, applies two sequential cryptographic functions to each chunk
+    /// using parallelism by threads and writes the results.
+    ///
+    /// # Arguments
+    /// - `fp`: file parameters
+    /// - `key1`: Cryptographic key for processing with first cryptographic function
+    /// - `key2`: Cryptographic key for processing with second cryptographic function
+    /// - `crypt_fn1`: First cryptographic function (e.g., first-pass encryption)
+    /// - `crypt_fn2`: Second cryptographic function (e.g., second-pass encryption)
+    ///
+    /// # Returns
+    /// - `Ok(())` on successful completion
+    /// - `Err` if file I/O fails or cryptographic functions fail
+    #[allow(clippy::type_complexity)]
+    fn io_chunks(
+        &mut self,
+        key_cha: &SecretSlice<u8>, 
+        key_aes: &SecretSlice<u8>,
+        crypt_fn: fn(&SecretSlice<u8>, &SecretSlice<u8>, &[u8], u32, bool, bool) -> Result<Vec<u8>>
+    ) -> Result<()> 
+    {
+        let cpu_count = num_cpus::get();
+        let mut chunk_count: u32 = 0;
+        let mut file_remaining = self.f_in_size;    
+        let compress = self.compress;
 
-    while file_remaining > 0 {
-        let mut child_threads = Vec::with_capacity(cpu_count);
+        while file_remaining > 0 {
+            let mut child_threads = Vec::with_capacity(cpu_count);
 
-        for _ in 0..cpu_count {
-            let key1 = key1.clone();
-            let key2 = key2.clone();
+            for _ in 0..cpu_count {
+                let key_cha = key_cha.clone();
+                let key_aes = key_aes.clone();
+                 
+                let cuk_size = if self.chunk_size == 0 {
+                    let mut buf = [0u8; 3];
+                    self.f_in.read_exact(&mut buf)?;
+                    file_remaining -= buf.len()as u64;
+                    let mut c_size = [0u8; 4];
+                    c_size[0] = buf[0];
+                    c_size[1] = buf[1];
+                    c_size[2] = buf[2];
+                    u32::from_le_bytes(c_size)
+                } else {
+                    self.chunk_size as u32
+                };
 
-            let (read_size, final_chunk) = if file_remaining <= fp.chunk_size as u64 {
-                (file_remaining as usize, true)
-            } else {
-                (fp.chunk_size, false)
-            };
-            file_remaining -= read_size as u64;
+                let (read_size, final_chunk) = if file_remaining <= cuk_size as u64 {
+                    (file_remaining as u32, true)
+                } else {
+                    (cuk_size, false)
+                };
+                file_remaining -= read_size as u64;
 
-            let mut buf_in = vec![0u8; read_size];
-            fp.f_in.read_exact(&mut buf_in)?;
+                let mut buf_in = vec![0u8; read_size as usize];
+                self.f_in.read_exact(&mut buf_in)?;
 
-            child_threads.push(thread::spawn(move || {
-                    let buf_tmp = crypt_fn1(&key1, &buf_in, chunk_count, final_chunk)
-                        .map_err(|e| e.to_string())?;
-                    let buf_out = crypt_fn2(&key2, &buf_tmp, chunk_count, final_chunk)
-                        .map_err(|e| e.to_string())?;
-                    Ok::<Vec<u8>, String>(buf_out)
-                }));
-            
-            if file_remaining == 0 {
-                break;
-            } 
-            chunk_count += 1;
+                child_threads.push(thread::spawn(move || {
+                        let buf_out = crypt_fn(&key_cha, &key_aes, &buf_in, chunk_count, final_chunk, compress)
+                            .map_err(|e| e.to_string())?;
+                        Ok::<Vec<u8>, String>(buf_out)
+                    }));
+                
+                if file_remaining == 0 {
+                    break;
+                } 
+                chunk_count += 1;
+            }
+
+            for child in child_threads {
+                let buf_out = child.join().unwrap()?;
+                self.f_out.write_all(&buf_out)?;
+            }
         }
-
-        for child in child_threads {
-            let buf_out = child.join().unwrap()?;
-            fp.f_out.write_all(&buf_out)?;
-        }
+        
+        Ok(())
     }
-    
-    Ok(())
 }
 
 
@@ -405,73 +423,129 @@ impl Encryption {
     /// Generates a random nonce and encrypts the buffer. The output includes
     /// the nonce prepended to the ciphertext for transmission.
     ///
-    /// The `chunk_count` and `final_chunk` parameters are accepted for API
-    /// compatibility with the ChaCha path but are ignored by this implementation.
-    ///
     /// # Arguments
     /// - `key`: 32‑byte AES key stored in a `SecretSlice<u8>`
     /// - `buf`: Data to encrypt
-    /// - `_chunk_count` — zero-based chunk index (ignored).
-    /// - `_final_chunk` — `true` if this is the last chunk (ignored).
     ///
     /// # Returns
     /// - `Ok(encrypted_data)` containing nonce + ciphertext (+ authentication tag)
     /// - `Err` if key derivation or encryption fails
-    fn aes_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8], _chunk_count: u32, _final_chunk: bool) -> Result<Vec<u8>> {
+    fn aes_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
         let nonce =  Aes256GcmSiv::generate_nonce(OsRng);
         let encrypted_buf = cipher.encrypt(&nonce, buf)
             .map_err(|e| format!("Failed to encrypt data: {:?}", e))?;
         let combined_data = [&nonce[..], &encrypted_buf[..]].concat();
-        
+
         Ok(combined_data)
+    }
+
+
+    /// Compresses a byte buffer using bzip2 compression.
+    ///
+    /// Uses bzip2 with best compression level to compress the provided input
+    /// buffer and returns the resulting bytes. Intended for compressing a
+    /// single chunk before encryption.
+    ///
+    /// # Arguments
+    /// - `buf`: input bytes to compress
+    ///
+    /// # Returns
+    /// - `Ok(compressed_bytes)` on success
+    /// - `Err` if compression or I/O fails
+    fn compress_buffer(buf: &[u8]) -> Result<Vec<u8>> {
+        let mut compressor = BzEncoder::new(buf, Compression::best());
+        let mut compressed_data = Vec::with_capacity(CHUNK_SIZE);
+        compressor.read_to_end(&mut compressed_data)?;
+        Ok(compressed_data)
+    }
+
+    /// Process a plaintext chunk through compression (optional), ChaCha20, then AES.
+    ///
+    /// This function is the per-chunk pipeline used during encryption: it
+    /// optionally compresses the input chunk, encrypts it with XChaCha20-Poly1305,
+    /// then encrypts the result with AES-256-GCM-SIV. The returned buffer has a
+    /// 3‑byte little-endian length prefix followed by the AES output (nonce + ciphertext + tag).
+    ///
+    /// # Arguments
+    /// - `key_cha`: ChaCha key for first-layer encryption
+    /// - `key_aes`: AES key for second-layer encryption
+    /// - `buf_in`: plaintext input bytes for this chunk
+    /// - `chunk_count`: zero-based index of the chunk
+    /// - `final_chunk`: whether this is the last chunk
+    /// - `compress`: whether to compress the plaintext before encryption
+    ///
+    /// # Returns
+    /// - `Ok(out_buf)` containing 3-byte length prefix + AES output
+    /// - `Err` on compression or encryption failure
+    fn encrypt_pipe(key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>, buf_in: &[u8], chunk_count: u32, final_chunk: bool, compress: bool) -> Result<Vec<u8>> {
+        let buf_zip = if compress {
+            Self::compress_buffer(buf_in)?
+        } else {
+            buf_in.to_vec()
+        };
+        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_zip, chunk_count, final_chunk)?;
+        let mut buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
+
+        // insert length of buffer into 3 bytes before buffer
+        let mut out_buf = buf_aes.len().to_le_bytes()[..3].to_vec();
+        out_buf.append(&mut buf_aes);
+
+        Ok(out_buf)
     }
 
     /// Encrypts a file using dual-layer encryption (ChaCha20 + AES-256-GCM-SIV).
     ///
     /// Prompts user for password, derives master key using Argon2, derives keys for 
-    /// ChaCha20 and AES-256-GCM-SIV, encrypts the file in chunks across multiple threads. 
-    /// Output file gets `.cce` extension.
+    /// ChaCha20 and AES-256-GCM-SIV, compresses (on demand) and encrypts the file in
+    /// chunks across multiple threads. Output file gets `.cce` extension.
     ///
     /// # Arguments
     /// - `filepath_in`: Path to input file to encrypt
     /// - `keyfilepath`: Optional path to an additional key file
+    /// - `compress`: Compress input file before encryption
     ///
     /// # Returns
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
-    fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>) -> Result<()> {
+    fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>, compress: bool) -> Result<()> {
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
     
         let f_in  = File::open(filepath_in)?;
-        let mut f_out = File::create(filepath_out)?;
 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
 
-        // write salts for password, chacha and aes key derivation to beginning of output file 
+        let mut f_out = File::create(filepath_out)?;
+
+        // file header
+        //   byte  description
+        //      0  version of file format
+        //      1  info about file format
+        //         bit 0: compression on(1)/off(0)
+        //  2..33  32-byte-salt of passwort hash
+        // 34..65  32-byte-salt of cha key derivation
+        // 66..97  32-byte-salt of aes key derivation
+        f_out.write_all(&[FILE_FORMAT_VERSION])?;
+        let file_format = [compress as u8];
+        f_out.write_all(&file_format)?;
         f_out.write_all(&salt_pw)?;
         f_out.write_all(&salt_cha)?;
         f_out.write_all(&salt_aes)?;
 
         // set file parameters
         let f_in_size = f_in.metadata()?.len();
-        let mut fp = FileParams {
+        let mut cio = CryptIo {
             f_in, 
             f_out, 
             f_in_size, 
             chunk_size: CHUNK_SIZE,
+            compress,
         };
 
-        crypt_io(
-            &mut fp,
-            &key_cha,
-            &key_aes,
-            Self::cha_encrypt_buffer,
-            Self::aes_encrypt_buffer
-        )?;
+        cio.io_chunks(&key_cha, &key_aes, Self::encrypt_pipe)?;
 
         Ok(())
     }
@@ -568,19 +642,14 @@ impl Decryption {
     /// Extracts the nonce from the beginning of the buffer and decrypts the remainder
     /// using the provided key. Verifies authentication tag during decryption.
     ///
-    /// The `chunk_count` and `final_chunk` parameters are accepted for API
-    /// compatibility with the ChaCha path but are ignored by this implementation.
-    ///
     /// # Arguments
     /// - `key`: 32‑byte AES key stored in a `SecretSlice<u8>`
     /// - `buf`: Data containing nonce + ciphertext (+ authentication tag)
-    /// - `_chunk_count` — zero-based chunk index (ignored).
-    /// - `_final_chunk` — `true` if this is the last chunk (ignored).
     ///
     /// # Returns
     /// - `Ok(plaintext)` containing decrypted data
     /// - `Err` if decryption fails or authentication tag verification fails
-    fn aes_decrypt_buffer(key: &SecretSlice<u8>, buf: &[u8], _chunk_count: u32, _final_chunk: bool) -> Result<Vec<u8>> {
+    fn aes_decrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init decryption: {:?}", e))?;
         let nonce = Nonce::from_slice(&buf[..AES_NONCE_SIZE]);
@@ -590,9 +659,55 @@ impl Decryption {
         Ok(decrypted_buf)
     }
 
+    /// Decompresses a bzip2-compressed buffer.
+    ///
+    /// Reads the provided buffer with a bzip2 decoder and returns the
+    /// decompressed result. This is the inverse of `Encryption::compress_buffer`.
+    ///
+    /// # Arguments
+    /// - `buf`: compressed input bytes
+    ///
+    /// # Returns
+    /// - `Ok(decompressed_bytes)` on success
+    /// - `Err` if decompression or I/O fails
+    fn decompress_buffer(buf: &[u8]) -> Result<Vec<u8>> {
+        let mut decompressor = BzDecoder::new(buf);
+        let mut decompressed_data = Vec::with_capacity(CHUNK_SIZE);
+        decompressor.read_to_end(&mut decompressed_data)?;
+        Ok(decompressed_data)
+    }
+
+    /// Reverse the encryption pipeline for a single chunk: AES then ChaCha, optional decompress.
+    ///
+    /// This function takes the AES-encrypted input, decrypts it using AES-256-GCM-SIV,
+    /// then decrypts the inner ChaCha20-Poly1305 ciphertext, and finally optionally
+    /// decompresses the resulting plaintext. It mirrors `Encryption::encrypt_pipe`.
+    ///
+    /// # Arguments
+    /// - `key_cha`: ChaCha key used for inner decryption
+    /// - `key_aes`: AES key used for outer decryption
+    /// - `buf_in`: input bytes (expected AES output: nonce + ciphertext + tag)
+    /// - `chunk_count`: zero-based chunk index (must match encryption)
+    /// - `final_chunk`: whether this is the last chunk (must match encryption)
+    /// - `decompress`: whether to decompress after decryption
+    ///
+    /// # Returns
+    /// - `Ok(plaintext_bytes)` on success
+    /// - `Err` if any decryption or decompression step fails
+    fn decrypt_pipe(key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>, buf_in: &[u8], chunk_count: u32, final_chunk: bool, decompress: bool) -> Result<Vec<u8>> {
+        let buf_aes = Self::aes_decrypt_buffer(key_aes, buf_in)?;
+        let buf_cha = Self::cha_decrypt_buffer(key_cha, &buf_aes, chunk_count, final_chunk)?;
+        if decompress {
+            let buf_zip = Self::decompress_buffer(&buf_cha)?;
+            Ok(buf_zip)
+        } else {
+            Ok(buf_cha)
+        }
+    }
+
     /// Decrypts a file encrypted with dual-layer encryption (AES-256-GCM-SIV + ChaCha20).
     ///
-    /// Reads salts from file, prompts user for password, derives master key using Argon2,
+    /// Reads and evaluates header from file, prompts user for password, derives master key using Argon2,
     /// derives keys for ChaCha20 and AES-256-GCM-SIV, decrypts the file in chunks across multiple threads. 
     /// Output file has `.cce` suffix removed.
     ///
@@ -612,34 +727,45 @@ impl Decryption {
             return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT}").into())
         }
 
-        let mut f_in  = File::open(filepath_in)?;
+        let mut f_in = File::open(filepath_in)?;
+
+        // Read file header
+        let mut header = [0u8; 2 + 3 * SALT_SIZE];
+        f_in.read_exact(&mut header)?;
+        let file_format_version = header[0];
+        let file_format         = header[1];
+        let salt_pw          = &header[2..34];
+        let salt_cha         = &header[34..66];
+        let salt_aes         = &header[66..98];
+        
+        // check format version
+        if file_format_version != FILE_FORMAT_VERSION {
+            return Err(format!(
+                "This input file format (v{file_format_version}) cannot be decoded with this app version."
+            ).into());
+        }
+
+        // get keys
+        let key = Self::hash_password(salt_pw, keyfilepath)?;
+        let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
+
+        // create output file
         let f_out = File::create(filepath_out)?;
 
-        let mut salt_pw = [0u8; SALT_SIZE];
-        let mut salt_cha = [0u8; SALT_SIZE];
-        let mut salt_aes = [0u8; SALT_SIZE];
-        f_in.read_exact(&mut salt_pw)?;
-        f_in.read_exact(&mut salt_cha)?;
-        f_in.read_exact(&mut salt_aes)?;
-
-        let key = Self::hash_password(&salt_pw, keyfilepath)?;
-        let (key_cha, key_aes) = Self::derive_keys(&salt_cha, &salt_aes, &key)?;
-
-        // set file parameters
-        let f_in_size = f_in.metadata()?.len() - 3 * SALT_SIZE as u64;
-        let mut fp = FileParams {
+        // set parameters
+        let f_in_size = f_in.metadata()?.len() - header.len() as u64;
+        let mut cio = CryptIo {
             f_in, 
             f_out, 
             f_in_size, 
-            chunk_size: CHUNK_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE, 
+            chunk_size: 0,
+            compress: (file_format & 0x01) != 0,
         };
 
-        crypt_io(
-            &mut fp,
-            &key_aes,
+        cio.io_chunks(
             &key_cha,
-            Self::aes_decrypt_buffer, 
-            Self::cha_decrypt_buffer
+            &key_aes,
+            Self::decrypt_pipe 
         )?;
 
         Ok(())
@@ -655,6 +781,9 @@ impl Decryption {
 mod tests {
     use super::*;
     use std::fs;
+    
+    const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;      // 16 bytes
+    const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE; // 16 bytes
 
     #[test]
     fn test_get_password_from_user() {
@@ -972,13 +1101,13 @@ mod tests {
         let key = SecretSlice::from(key.to_vec());
         let data: [u8; 100] = rand::random();
 
-        let encrypt_data = Encryption::aes_encrypt_buffer(&key, &data, 0, false).unwrap();
-        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
+        let encrypt_data = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
+        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data).unwrap();
         assert_eq!(encrypt_data.len(), data.len() + AES_NONCE_SIZE + AES_TAG_SIZE);
         assert_eq!(data, decrypt_data[..]);
 
         // second encryption must produce different output of the same input
-        let encrypt_data2 = Encryption::aes_encrypt_buffer(&key, &data, 0, false).unwrap();
+        let encrypt_data2 = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
         // nonce part must be different
         assert_ne!(encrypt_data[..AES_NONCE_SIZE], encrypt_data2[..AES_NONCE_SIZE]);
         // encrypted data part must be different
@@ -987,18 +1116,63 @@ mod tests {
         // corrupt 'nonce'
         let mut bad_data = encrypt_data.clone();
         bad_data[0] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data, 0, false).is_err());
+        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
 
         // corrupt 'data'
         let mut bad_data = encrypt_data.clone();
         bad_data[AES_NONCE_SIZE+1] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data, 0, false).is_err());
+        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
 
         // wrong key
         let mut bad_key = key.clone();
         bad_key.expose_secret_mut()[0] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&bad_key, &encrypt_data, 0, false).is_err());
+        assert!(Decryption::aes_decrypt_buffer(&bad_key, &encrypt_data).is_err());
     }
+
+    #[test]
+    fn test_de_compress_buffer() {
+        let dat_in = "Hello test".repeat(10);
+
+        // compress
+        let out_z = Encryption::compress_buffer(dat_in.as_bytes()).unwrap();
+        assert!(out_z.len() < dat_in.len());
+        assert!(!out_z.is_empty());
+
+        //decompress
+        let dat_out = Decryption::decompress_buffer(&out_z).unwrap();
+        assert_eq!(dat_in.as_bytes(), dat_out);
+
+        // empty input
+        let out_z = Encryption::compress_buffer(&[]).unwrap();
+        assert!(!out_z.is_empty());
+        let dat_out = Decryption::decompress_buffer(&out_z).unwrap();
+        assert!(dat_out.is_empty());
+    }
+
+    #[test]
+    fn test_crypt_pipe() {
+        let key_cha: [u8; 32]  = rand::random();
+        let key_cha = SecretSlice::from(key_cha.to_vec());
+        let key_aes: [u8; 32]  = rand::random();
+        let key_aes = SecretSlice::from(key_aes.to_vec());
+        let data: [u8; 100] = rand::random();
+
+        // with compression
+        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, true).unwrap();
+        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, true).unwrap();
+        assert_eq!(data, &out_dec[..]);
+        // check length info in encrypted data
+        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
+        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
+
+        // without compression
+        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, false).unwrap();
+        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, false).unwrap();
+        assert_eq!(data, &out_dec[..]);
+        // check length info in encrypted data
+        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
+        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
+    }    
 
     #[test]
     fn test_crypt() {
@@ -1017,7 +1191,7 @@ mod tests {
         assert_eq!(get_password_from_user(false).unwrap().expose_secret(), "abc123test");
 
         // encrypt, backup original file, decrypt
-        Encryption::encrypt(&filepath_in, None).unwrap();
+        Encryption::encrypt(&filepath_in, None, false).unwrap();
         // encrypted file must be different than original data
         assert_ne!(data, fs::read(&filepath_out).unwrap());
         // backup by renaming
@@ -1059,7 +1233,7 @@ mod tests {
         fs::write(&filepath_kf, &data_kf).unwrap();
 
         // use keyfile, encrypt, backup original file, decrypt
-        Encryption::encrypt(&filepath_in, Some(&filepath_kf)).unwrap();
+        Encryption::encrypt(&filepath_in, Some(&filepath_kf), false).unwrap();
         fs::rename(&filepath_in, &filepath_org).unwrap();
         Decryption::decrypt(&filepath_out, Some(&filepath_kf)).unwrap();
 
@@ -1071,11 +1245,11 @@ mod tests {
         assert!(Decryption::decrypt(&filepath_out, None).is_err());
 
         // key file does not exist
-        assert!(Encryption::encrypt(&filepath_in, Some(&PathBuf::from("test_miss"))).is_err());
+        assert!(Encryption::encrypt(&filepath_in, Some(&PathBuf::from("test_miss")), false).is_err());
         assert!(Decryption::decrypt(&filepath_out, Some(&PathBuf::from("test_miss"))).is_err());
 
         // input file does not exist
-        assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None).is_err());
+        assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None, false).is_err());
         assert!(Decryption::decrypt(&PathBuf::from("test_miss"), None).is_err());
 
         // cleanup
@@ -1089,12 +1263,12 @@ mod tests {
     #[ignore="only for benchmarking"]
     fn test_crypt_bench() {
         // a file 'ttt' must already exist
-        let filepath_in = PathBuf::from("ttt");     
+        let filepath_in = PathBuf::from("ttt.txt");     
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
 
-        Encryption::encrypt(&filepath_in, None).unwrap();
-        Decryption::decrypt(&filepath_out, None).unwrap();
+        Encryption::encrypt(&filepath_in, None, false).unwrap();
+        //Decryption::decrypt(&filepath_out, None).unwrap();
     }
 
 }
