@@ -144,7 +144,7 @@ pub struct CryptIo {
     /// Output file to write processed data to
     f_out: File,
     /// Total size in bytes of input data remaining to be read
-    f_in_size: u64, 
+    f_in_size_remaining: u64, 
     /// Size in bytes of each chunk to process per iteration
     chunk_size: usize,
     /// Compress data before encryption
@@ -153,8 +153,44 @@ pub struct CryptIo {
 
 impl CryptIo {
 
-    pub fn new(f_in: File, f_out: File, f_in_size: u64, chunk_size: usize, compress: bool) -> CryptIo {
-        Self { f_in, f_out, f_in_size, chunk_size, compress }
+    pub fn new(f_in: File, f_out: File, f_in_size_remaining: u64, chunk_size: usize, compress: bool) -> Self {
+        Self { f_in, f_out, f_in_size_remaining, chunk_size, compress }
+    }
+
+    /// Calculate how much data is left in the input file, how much need to be read for the current chunk 
+    /// and whether it is the final chunk. 
+    /// 
+    /// The remaining bytes to be read is updated in this method (`self.f_in_size_remaining`).
+    /// If compression is used, the chunk size varies. The size is coded in the 3 bytes 
+    /// at the start of a chunk in little endian order.
+    /// 
+    /// # Returns
+    /// - `Ok((read_size, final_chunk))` chunk size to be read and if it is the final chunk
+    /// - `Err` if file I/O or variable conversion fails 
+    fn input_sizes(&mut self) -> Result<(usize, bool)> {
+        let cuk_size = if self.chunk_size == 0 {
+            // dynamic chunk size (if compression is used)
+            let mut buf = [0u8; AES_LENGTH_SIZE];
+            self.f_in.read_exact(&mut buf)?;
+            self.f_in_size_remaining -= buf.len() as u64;
+            let c_size: [u8; 4] = [&buf[..], &[0]].concat().try_into().unwrap();
+            u32::from_le_bytes(c_size)
+        } else {
+            // fixed chunk size
+            u32::try_from(self.chunk_size)?
+        };
+
+        let (read_size, final_chunk) = 
+            if self.f_in_size_remaining <= u64::from(cuk_size) {
+                // final chunk
+                (u32::try_from(self.f_in_size_remaining)?, true)
+            } else {
+                (cuk_size, false)
+            };
+
+        self.f_in_size_remaining -= u64::from(read_size);
+
+        Ok((read_size as usize, final_chunk))
     }
 
     /// Performs cryptographic I/O operations on a file using chunked processing with multithreading.
@@ -181,38 +217,19 @@ impl CryptIo {
     ) -> Result<()> 
     {
         let cpu_count = num_cpus::get();
-        let mut chunk_count: u32 = 0;
-        let mut file_remaining = self.f_in_size;    
+        let mut chunk_count: u32 = 0;  
         let compress = self.compress;
 
-        while file_remaining > 0 {
+        while self.f_in_size_remaining > 0 {
             let mut child_threads = Vec::with_capacity(cpu_count);
 
             for _ in 0..cpu_count {
                 let key_cha = key_cha.clone();
                 let key_aes = key_aes.clone();
-                 
-                let cuk_size = if self.chunk_size == 0 {
-                    let mut buf = [0u8; 3];
-                    self.f_in.read_exact(&mut buf)?;
-                    file_remaining -= buf.len()as u64;
-                    let mut c_size = [0u8; 4];
-                    c_size[0] = buf[0];
-                    c_size[1] = buf[1];
-                    c_size[2] = buf[2];
-                    u32::from_le_bytes(c_size)
-                } else {
-                    self.chunk_size as u32
-                };
 
-                let (read_size, final_chunk) = if file_remaining <= cuk_size as u64 {
-                    (file_remaining as u32, true)
-                } else {
-                    (cuk_size, false)
-                };
-                file_remaining -= read_size as u64;
+                let (read_size, final_chunk) = self.input_sizes()?;
 
-                let mut buf_in = vec![0u8; read_size as usize];
+                let mut buf_in = vec![0u8; read_size];
                 self.f_in.read_exact(&mut buf_in)?;
 
                 child_threads.push(thread::spawn(move || {
@@ -221,7 +238,7 @@ impl CryptIo {
                         Ok::<Vec<u8>, String>(buf_out)
                     }));
                 
-                if file_remaining == 0 {
+                if self.f_in_size_remaining == 0 {
                     break;
                 } 
                 chunk_count += 1;
@@ -440,25 +457,25 @@ mod tests {
         let data: [u8; 100] = rand::random();
 
         let encrypt_data = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
-        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data).unwrap();
-        assert_eq!(encrypt_data.len(), data.len() + AES_NONCE_SIZE + AES_TAG_SIZE);
+        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data[3..]).unwrap();
+        assert_eq!(encrypt_data.len(), data.len() + AES_LENGTH_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE);
         assert_eq!(data, decrypt_data[..]);
 
         // second encryption must produce different output of the same input
         let encrypt_data2 = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
         // nonce part must be different
-        assert_ne!(encrypt_data[..AES_NONCE_SIZE], encrypt_data2[..AES_NONCE_SIZE]);
+        assert_ne!(encrypt_data[AES_LENGTH_SIZE..AES_LENGTH_SIZE + AES_NONCE_SIZE], encrypt_data2[AES_LENGTH_SIZE..AES_LENGTH_SIZE + AES_NONCE_SIZE]);
         // encrypted data part must be different
-        assert_ne!(encrypt_data[AES_NONCE_SIZE..], encrypt_data2[AES_NONCE_SIZE..]);
+        assert_ne!(encrypt_data[3 + AES_NONCE_SIZE..], encrypt_data2[3 + AES_NONCE_SIZE..]);
 
         // corrupt 'nonce'
         let mut bad_data = encrypt_data.clone();
-        bad_data[0] ^= 0xFF;
+        bad_data[AES_LENGTH_SIZE+1] ^= 0xFF;
         assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
 
         // corrupt 'data'
         let mut bad_data = encrypt_data.clone();
-        bad_data[AES_NONCE_SIZE+1] ^= 0xFF;
+        bad_data[AES_LENGTH_SIZE + AES_NONCE_SIZE + 1] ^= 0xFF;
         assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
 
         // wrong key

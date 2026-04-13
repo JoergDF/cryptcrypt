@@ -122,7 +122,7 @@ impl Encryption {
 
         // change nonce by XOR of chunk count and final chunk flag
         // that prevents reordering or truncation of chunk sequence
-        nonce[0] ^= final_chunk as u8;
+        nonce[0] ^= u8::from(final_chunk);
         for (i, ccb) in chunk_count.to_le_bytes().iter().enumerate() {
             nonce[i+1] ^= ccb;
         }
@@ -137,14 +137,14 @@ impl Encryption {
     /// Encrypts a buffer using AES-256-GCM-SIV.
     ///
     /// Generates a random nonce and encrypts the buffer. The output includes
-    /// the nonce prepended to the ciphertext for transmission.
+    /// the length of nonce + ciphertext, the nonce and the ciphertext for transmission.
     ///
     /// # Arguments
     /// - `key`: 32‑byte AES key stored in a `SecretSlice<u8>`
     /// - `buf`: Data to encrypt
     ///
     /// # Returns
-    /// - `Ok(encrypted_data)` containing nonce + ciphertext (+ authentication tag)
+    /// - `Ok(encrypted_data)` containing  buffer length + nonce + ciphertext (+ authentication tag)
     /// - `Err` if key derivation or encryption fails
     pub fn aes_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
@@ -152,7 +152,9 @@ impl Encryption {
         let nonce =  Aes256GcmSiv::generate_nonce(OsRng);
         let encrypted_buf = cipher.encrypt(&nonce, buf)
             .map_err(|e| format!("Failed to encrypt data: {:?}", e))?;
-        let combined_data = [&nonce[..], &encrypted_buf[..]].concat();
+
+        let combined_len = (nonce.len() + encrypted_buf.len()).to_le_bytes();
+        let combined_data = [&combined_len[..AES_LENGTH_SIZE], &nonce[..], &encrypted_buf[..]].concat();
 
         Ok(combined_data)
     }
@@ -193,22 +195,18 @@ impl Encryption {
     /// - `compress`: whether to compress the plaintext before encryption
     ///
     /// # Returns
-    /// - `Ok(out_buf)` containing 3-byte length prefix + AES output
+    /// - `Ok(out_buf)` containing AES output
     /// - `Err` on compression or encryption failure
     pub fn encrypt_pipe(key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>, buf_in: &[u8], chunk_count: u32, final_chunk: bool, compress: bool) -> Result<Vec<u8>> {
         let buf_zip = if compress {
-            Self::compress_buffer(buf_in)?
+            &Self::compress_buffer(buf_in)?
         } else {
-            buf_in.to_vec()
+            buf_in
         };
-        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_zip, chunk_count, final_chunk)?;
-        let mut buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
+        let buf_cha = Self::cha_encrypt_buffer(key_cha, buf_zip, chunk_count, final_chunk)?;
+        let buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
 
-        // insert length of buffer into 3 bytes before buffer
-        let mut out_buf = buf_aes.len().to_le_bytes()[..3].to_vec();
-        out_buf.append(&mut buf_aes);
-
-        Ok(out_buf)
+        Ok(buf_aes)
     }
 
     /// Encrypts a file using dual-layer encryption (ChaCha20 + AES-256-GCM-SIV).
@@ -245,7 +243,7 @@ impl Encryption {
         // 34..65  32-byte-salt of cha key derivation
         // 66..97  32-byte-salt of aes key derivation
         f_out.write_all(&[FILE_FORMAT_VERSION])?;
-        let file_format = [compress as u8];
+        let file_format = [u8::from(compress)];
         f_out.write_all(&file_format)?;
         f_out.write_all(&salt_pw)?;
         f_out.write_all(&salt_cha)?;

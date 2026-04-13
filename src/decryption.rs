@@ -85,7 +85,7 @@ impl Decryption {
         let mut nonce = *XNonce::from_slice(&buf[..CHA_NONCE_SIZE]);
         
         // change nonce by XOR of final chunk flag and chunk count
-        nonce[0] ^= final_chunk as u8;
+        nonce[0] ^= u8::from(final_chunk);
         for (i, ccb) in chunk_count.to_le_bytes().iter().enumerate() {
             nonce[i+1] ^= ccb;
         }

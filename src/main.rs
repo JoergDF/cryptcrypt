@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 use clap::Parser;
+use std::process::ExitCode;
 use typenum::Unsigned;
 use aes_gcm_siv::{Aes256GcmSiv, AeadCore};
 use chacha20poly1305::{XChaCha20Poly1305};
@@ -18,6 +19,7 @@ const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
 const MAX_KEYFILE_CHUNKS: usize = 64;
 const SALT_SIZE: usize          = 32; 
 const KEY_SIZE: usize           = 32;
+const AES_LENGTH_SIZE: usize    = 3;
 const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USIZE;      // 12 bytes
 const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
 #[cfg(test)]
@@ -56,19 +58,27 @@ struct Args {
 /// based on the provided flags.
 ///
 /// # Returns
-/// - `Ok(())` on successful completion
-/// - `Err` if an error occurs during encryption/decryption
-fn main() -> Result<()> {
+/// - `ExitCode::SUCCESS` on successful completion
+/// - `ExitCode::FAILURE` if an error occurs during encryption/decryption
+/// 
+fn main() -> ExitCode {
     let args = Args::parse();
 
     let filepath = args.file;
     let keyfilepath = args.keyfile;
-    
-    if args.decrypt {
-       Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
-    } else {
-       Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress)?;
-    }
 
-    Ok(())
+    let result = 
+        if args.decrypt {
+            Decryption::decrypt(&filepath, keyfilepath.as_ref())
+        } else {
+            Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress)
+        };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}", e);
+            ExitCode::FAILURE
+        }
+    }
 }
