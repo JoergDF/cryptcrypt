@@ -5,8 +5,10 @@ use std::process::ExitCode;
 use typenum::Unsigned;
 use aes_gcm_siv::{Aes256GcmSiv, AeadCore};
 use chacha20poly1305::{XChaCha20Poly1305};
+use parse_size::Config;
 use crate::encryption::Encryption;
 use crate::decryption::Decryption;
+
 
 mod common;
 mod encryption;
@@ -48,6 +50,11 @@ struct Args {
     #[arg(short = 'z', long, default_value_t = false)]
     compress: bool,
 
+    /// Split encrypted file into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
+    #[arg(short, long, value_delimiter = ',', 
+      value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
+    split: Vec<u64>,
+
     /// File that should be encrypted or decrypted
     file: PathBuf,
 }
@@ -71,7 +78,7 @@ fn main() -> ExitCode {
         if args.decrypt {
             Decryption::decrypt(&filepath, keyfilepath.as_ref())
         } else {
-            Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress)
+            Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)
         };
 
     match result {

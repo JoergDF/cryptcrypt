@@ -209,16 +209,18 @@ impl Decryption {
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
 
         // create output file
-        let f_out = File::create(filepath_out)?;
+        let f_out = File::create(filepath_out.clone())?;
 
         // set parameters
         let f_in_size = f_in.metadata()?.len() - header.len() as u64;
         let mut cio = CryptIo::new (
             f_in, 
-            f_out, 
             f_in_size, 
+            f_out, 
+            filepath_out,
             0,
             (file_format & 0x01) != 0,
+            vec![]
         );
 
         cio.io_chunks(

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305};
@@ -159,7 +159,6 @@ impl Encryption {
         Ok(combined_data)
     }
 
-
     /// Compresses a byte buffer using bzip2 compression.
     ///
     /// Uses bzip2 with best compression level to compress the provided input
@@ -213,26 +212,32 @@ impl Encryption {
     ///
     /// Prompts user for password, derives master key using Argon2, derives keys for 
     /// ChaCha20 and AES-256-GCM-SIV, compresses (on demand) and encrypts the file in
-    /// chunks across multiple threads. Output file gets `.cce` extension.
-    ///
+    /// chunks across multiple threads. Output file gets `.cce` extension. Or output can 
+    /// be split into several files, which get extensions `.c00`, `.c01`, `.c02`, ...
+    /// 
     /// # Arguments
     /// - `filepath_in`: Path to input file to encrypt
     /// - `keyfilepath`: Optional path to an additional key file
     /// - `compress`: Compress input file before encryption
+    /// - `split`: List of output split sizes; if empty, no split is done.
     ///
     /// # Returns
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
-    pub fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>, compress: bool) -> Result<()> {
+    pub fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>) -> Result<()> {
         let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        if split.is_empty() {
+            filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        } else {
+            filepath_out.add_extension("c00");
+        }
     
         let f_in  = File::open(filepath_in)?;
 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
 
-        let mut f_out = File::create(filepath_out)?;
+        let f_out = File::create(filepath_out.clone())?;
 
         // file header
         //   byte  description
@@ -242,23 +247,26 @@ impl Encryption {
         //  2..33  32-byte-salt of passwort hash
         // 34..65  32-byte-salt of cha key derivation
         // 66..97  32-byte-salt of aes key derivation
-        f_out.write_all(&[FILE_FORMAT_VERSION])?;
-        let file_format = [u8::from(compress)];
-        f_out.write_all(&file_format)?;
-        f_out.write_all(&salt_pw)?;
-        f_out.write_all(&salt_cha)?;
-        f_out.write_all(&salt_aes)?;
+        let mut header = vec![];
+        header.push(FILE_FORMAT_VERSION);
+        header.push(u8::from(compress));
+        header.extend(salt_pw);
+        header.extend(salt_cha);
+        header.extend(salt_aes);
 
         // set file parameters
         let f_in_size = f_in.metadata()?.len();
         let mut cio = CryptIo::new (
             f_in, 
-            f_out, 
             f_in_size, 
+            f_out, 
+            filepath_out,
             CHUNK_SIZE,
             compress,
+            split
         );
 
+        cio.write_output_split(&header)?;
         cio.io_chunks(&key_cha, &key_aes, Self::encrypt_pipe)?;
 
         Ok(())
@@ -321,6 +329,5 @@ mod tests {
         assert_ne!(salt_aes, salt_aes2);
         assert_ne!(key_cha.expose_secret(), key_cha2.expose_secret());
         assert_ne!(key_aes.expose_secret(), key_aes2.expose_secret());
-
     }
 }
