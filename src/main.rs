@@ -17,6 +17,7 @@ mod decryption;
 
 const FILE_FORMAT_VERSION: u8   = 3;
 const ENCRYPTED_FILE_EXT: &str  = "cce";
+const SPLIT_ENC_FILE_EXT: &str  = "c00";
 const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
 const MAX_KEYFILE_CHUNKS: usize = 64;
 const SALT_SIZE: usize          = 32; 
@@ -33,12 +34,14 @@ const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZ
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 
-/// Program for encryption and decryption of a file. 
-/// If no option is given, file is encrypted.
 #[derive(Parser)]
 #[command(version, about, verbatim_doc_comment, long_about = None)]
+/// Program for encryption and decryption of a file.
+/// If no option is given, file is encrypted. 
+/// With option -s the encrypted output is split into files with extensions .c00, .c01, .c02, ...
+/// If a file ending on .c00 is decrypted, the whole split series will be read.
 struct Args {
-    /// Decrypt file
+    /// Decrypt file (with extension '.cce' or for split series '.c00')
     #[arg(short, long, default_value_t = false)]
     decrypt: bool,
 
@@ -50,7 +53,7 @@ struct Args {
     #[arg(short = 'z', long, default_value_t = false)]
     compress: bool,
 
-    /// Split encrypted file into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
+    /// Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
     #[arg(short, long, value_delimiter = ',', 
       value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
     split: Vec<u64>,
@@ -70,7 +73,7 @@ struct Args {
 /// 
 fn main() -> ExitCode {
     let args = Args::parse();
-
+    
     let filepath = args.file;
     let keyfilepath = args.keyfile;
 

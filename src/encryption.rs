@@ -229,7 +229,7 @@ impl Encryption {
         if split.is_empty() {
             filepath_out.add_extension(ENCRYPTED_FILE_EXT);
         } else {
-            filepath_out.add_extension("c00");
+            filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
         }
     
         let f_in  = File::open(filepath_in)?;
@@ -257,17 +257,18 @@ impl Encryption {
         // set file parameters
         let f_in_size = f_in.metadata()?.len();
         let mut cio = CryptIo::new (
-            f_in, 
+            f_in,
+            filepath_in.clone(),
             f_in_size, 
             f_out, 
             filepath_out,
             CHUNK_SIZE,
-            compress,
+            vec![],
             split
         );
 
-        cio.write_output_split(&header)?;
-        cio.io_chunks(&key_cha, &key_aes, Self::encrypt_pipe)?;
+        cio.write_files(&header)?;
+        cio.io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe)?;
 
         Ok(())
     }

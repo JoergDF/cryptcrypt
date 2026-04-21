@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::thread;
 use rpassword::{prompt_password, read_password_from_bufread};
@@ -37,7 +37,6 @@ fn get_password_from_user(verify: bool) -> Result<SecretString> {
         }
     );
 
-    
     if verify {
         let password_rep = SecretString::from( 
             if cfg!(test) {
@@ -142,18 +141,20 @@ pub fn key_derivation(key: &SecretSlice<u8>, salt: &[u8], info: &[u8]) -> Result
 pub struct CryptIo {
     /// Input file to read data from
     f_in: File, 
+    /// Path of input file
+    f_in_path: PathBuf,
     /// Total size in bytes of input data remaining to be read
     f_in_size_remaining: u64, 
     /// Output file to write processed data to
     f_out: File,
-    /// Path (name) of output file
+    /// Path of output file
     f_out_path: PathBuf,
     /// Size in bytes of each chunk to process per iteration
     chunk_size: usize,
-    /// Compress data before encryption, decopmress after decryption
-    compress: bool,
-    /// List of split sizes
-    split: Vec<u64>,
+    /// List of split sizes for input
+    f_in_split: Vec<u64>,    
+    /// List of split sizes for output
+    f_out_split: Vec<u64>,
     /// Index into split list
     split_index: usize,
     /// Count written bytes during split operation
@@ -163,8 +164,9 @@ pub struct CryptIo {
 impl CryptIo {
 
     /// Initialize struct
-    pub fn new(f_in: File, f_in_size_remaining: u64, f_out: File, f_out_path: PathBuf, chunk_size: usize, compress: bool, split: Vec<u64>) -> Self {
-        Self { f_in, f_in_size_remaining, f_out, f_out_path, chunk_size, compress, split, split_index: 0, f_out_write_count: 0 }
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(f_in: File, f_in_path: PathBuf, f_in_size_remaining: u64, f_out: File, f_out_path: PathBuf, chunk_size: usize, f_in_split: Vec<u64>, f_out_split: Vec<u64>) -> Self {
+        Self { f_in, f_in_path, f_in_size_remaining, f_out, f_out_path, chunk_size, f_in_split, f_out_split, split_index: 0, f_out_write_count: 0 }
     }
 
     /// Calculate how much data is left in the input file, how much need to be read for the current chunk 
@@ -181,12 +183,12 @@ impl CryptIo {
         let cuk_size = if self.chunk_size == 0 {
             // dynamic chunk size (if compression is used)
             let mut buf = [0u8; AES_LENGTH_SIZE];
-            self.f_in.read_exact(&mut buf)?;
+            self.read_files(&mut buf)?;
             self.f_in_size_remaining -= buf.len() as u64;
             let c_size: [u8; 4] = [&buf[..], &[0]].concat().try_into().unwrap();
             u32::from_le_bytes(c_size)
         } else {
-            // fixed chunk size
+            // static chunk size
             u32::try_from(self.chunk_size)?
         };
 
@@ -203,17 +205,56 @@ impl CryptIo {
         Ok((read_size as usize, final_chunk))
     }
 
+
+    pub fn read_files(&mut self, buf: &mut [u8]) -> Result<()> {
+        if self.f_in_split.is_empty() {
+            self.f_in.read_exact(&mut buf[..])?;
+        } else {
+            let mut file_remaining = self.f_in_split[self.split_index] - self.f_in.stream_position()?; 
+            let buf_len = u64::try_from(buf.len())?;
+            let mut buf_start: u64 = 0;
+            let mut buf_end: u64   = 0;
+
+            while buf_end < buf_len {
+                if buf_end - buf_start == file_remaining {
+                    self.split_index += 1;
+                    let f_in_name = &mut self.f_in_path;
+                    f_in_name.set_extension(format!("c{:02}", self.split_index));
+                    if let Ok(f_in) = File::open(&f_in_name) {
+                        self.f_in = f_in;
+                        file_remaining = self.f_in_split[self.split_index];
+                    } else {
+                        // no more files
+                        break;
+                    }
+                }
+
+                buf_start = buf_end;
+                if (buf_len - buf_start) <= file_remaining {
+                    buf_end = buf_len;
+                } else { 
+                    buf_end = buf_start + file_remaining;
+                }
+
+                let (s, e) = (usize::try_from(buf_start)?, usize::try_from(buf_end)?);
+                self.f_in.read_exact(&mut buf[s..e])?;
+            }
+        } 
+
+        Ok(())
+    }
+
     /// Writes the provided buffer across one or more output files according to the configured splits.
     ///
-    /// - If `self.split` is empty: append the entire buffer to the current output file.
-    /// - If `self.split` contains sizes: fill each target size in order, then create the next file by
+    /// - If `self.f_out_split` is empty: append the entire buffer to the current output file.
+    /// - If `self.f_out_split` contains sizes: fill each target size in order, then create the next file by
     ///   updating `self.f_out_path` extension to `c01`, `c02`, ...
     ///
     /// # Returns
     /// - `Ok(())` on success
     /// - `Err(...)` when an I/O or conversion error occurs
-    pub fn write_output_split(&mut self, buf: &[u8]) -> Result<()> {
-        if self.split.is_empty() {
+    pub fn write_files(&mut self, buf: &[u8]) -> Result<()> {
+        if self.f_out_split.is_empty() {
             self.f_out.write_all(buf)?;
         } else {
             let mut buf_start: u64 = 0;
@@ -221,7 +262,7 @@ impl CryptIo {
             let buf_len = u64::try_from(buf.len())?;
 
             while buf_end < buf_len { 
-                if self.split[self.split_index] == self.f_out_write_count {
+                if self.f_out_split[self.split_index] == self.f_out_write_count {
                     // next split
                     self.split_index += 1;
                     buf_start = buf_end;
@@ -235,11 +276,11 @@ impl CryptIo {
                 
                 // if there aren't any more elements in the split list, then append all coming bytes to the last (current) file,
                 // hence clear the split list, so this while loop won't be run again
-                if let Some(split_chunk) = self.split.get(self.split_index).copied() {
+                if let Some(split_chunk) = self.f_out_split.get(self.split_index).copied() {
                     buf_end = buf_len.min( buf_start + (split_chunk - self.f_out_write_count) );
                 } else {
                     buf_end = buf_len;
-                    self.split.clear();
+                    self.f_out_split.clear();
                 }
 
                 let (s, e) = (usize::try_from(buf_start)?, usize::try_from(buf_end)?);
@@ -260,6 +301,7 @@ impl CryptIo {
     /// # Arguments
     /// - `key_cha`: Cryptographic key for XChaCha20-Poly1305
     /// - `key_aes`: Cryptographic key for AES-256-GCM-SIV 
+    /// - `compress`: Compress data before encryption, decompress after decryption
     /// - `crypt_fn`: Cryptographic function processing compression, XChaCha20-Poly1305, AES-256-GCM-SIV
     ///
     /// # Returns
@@ -270,11 +312,11 @@ impl CryptIo {
         &mut self,
         key_cha: &SecretSlice<u8>, 
         key_aes: &SecretSlice<u8>,
+        compress: bool,
         crypt_fn: fn(&SecretSlice<u8>, &SecretSlice<u8>, &[u8], u32, bool, bool) -> Result<Vec<u8>>
     ) -> Result<()> {
         let cpu_count = num_cpus::get();
         let mut chunk_count: u32 = 0;  
-        let compress = self.compress;
 
         while self.f_in_size_remaining > 0 {
             let mut child_threads = Vec::with_capacity(cpu_count);
@@ -284,9 +326,8 @@ impl CryptIo {
                 let key_aes = key_aes.clone();
 
                 let (read_size, final_chunk) = self.input_sizes()?;
-
                 let mut buf_in = vec![0u8; read_size];
-                self.f_in.read_exact(&mut buf_in)?;
+                self.read_files(&mut buf_in)?;
 
                 child_threads.push(thread::spawn(move || {
                         let buf_out = crypt_fn(&key_cha, &key_aes, &buf_in, chunk_count, final_chunk, compress)
@@ -302,7 +343,7 @@ impl CryptIo {
 
             for child in child_threads {
                 let buf_out = child.join().unwrap()?;
-                self.write_output_split(&buf_out)?;
+                self.write_files(&buf_out)?;
             }
         }
         
@@ -436,26 +477,72 @@ mod tests {
         assert_ne!(okm1.expose_secret(), okm6.expose_secret());
     }
 
+        #[test]
+    fn test_read_files() {
+        let data0: [u8; 1000] = rand::random();
+        fs::write("test_split_in.c00", data0).unwrap();
+        let data1: [u8; 4] = rand::random();
+        fs::write("test_split_in.c01", data1).unwrap();
+        let data2: [u8; 2024] = rand::random();
+        fs::write("test_split_in.c02", data2).unwrap();
+
+        let f_in_split: Vec<u64> = vec![data0.len().try_into().unwrap(), data1.len().try_into().unwrap(), data2.len().try_into().unwrap()];
+
+        let f_out_path = PathBuf::from("test_split_out_dummy.bin");
+        let f_out = File::create(&f_out_path).unwrap();
+
+        // only first split
+        let mut buf = [0u8; 1000];
+        let f_in_path = PathBuf::from("test_split_in.c00");
+        let f_in = File::open(&f_in_path).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, f_in_split.clone(), vec![]);
+        cio.read_files(&mut buf).unwrap();
+        assert_eq!(buf, data0);
+
+        // all splits
+        let mut buf = [0u8; 3028];
+        let f_in = File::open(&f_in_path).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, f_in_split.clone(), vec![]);
+        cio.read_files(&mut buf).unwrap();
+        assert_eq!(buf[..], [&data0[..], &data1[..], &data2[..]].concat());
+
+        // 2 reads
+        let mut buf0 = [0u8; 4];
+        let mut buf1 = [0u8; 2000];
+        let f_in = File::open(&f_in_path).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, f_in_split.clone(), vec![]);
+        cio.read_files(&mut buf0).unwrap();
+        assert_eq!(buf0[..], data0[..4]);
+        cio.read_files(&mut buf1).unwrap();
+        assert_eq!(buf1[..], [&data0[4..], &data1[..], &data2[..1000]].concat());
+
+        // cleanup
+        let _ = fs::remove_file(&f_out_path);
+        let _ = fs::remove_file("test_split_in.c00");
+        let _ = fs::remove_file("test_split_in.c01");
+        let _ = fs::remove_file("test_split_in.c02");
+    }
+
     #[test]
-    fn test_write_output_split() {
+    fn test_write_files() {
         let f_in_path = PathBuf::from("test_split_in_dummy.bin");
         let f_in = File::create(&f_in_path).unwrap();
         let f_out_path = PathBuf::from("test_split_out.c00");
-        let buf: [u8; 1024]  = rand::random();
+        let buf: [u8; 1024] = rand::random();
         
         // no split
         let split = vec![];
         let f_out = File::create(&f_out_path).unwrap();
-        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, false, split);
-        cio.write_output_split(&buf).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, vec![], split);
+        cio.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
         let _ = fs::remove_file("test_split_out.c00");
 
         // 2 split files, 1 input buffer
         let split = vec![512];
         let f_out = File::create(&f_out_path).unwrap();
-        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, false, split);
-        cio.write_output_split(&buf).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, vec![], split);
+        cio.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 512);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 512);              
         let _ = fs::remove_file("test_split_out.c00");
@@ -464,9 +551,9 @@ mod tests {
         // 3 split files, 2 input buffers
         let split = vec![1024, 10];
         let f_out = File::create(&f_out_path).unwrap();
-        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, false, split);
-        cio.write_output_split(&buf).unwrap();
-        cio.write_output_split(&buf).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, vec![], split);
+        cio.write_files(&buf).unwrap();
+        cio.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 10);  
         assert_eq!(fs::metadata("test_split_out.c02").unwrap().len(), 1014);          
@@ -477,9 +564,9 @@ mod tests {
         // splits same size as input buffer
         let split = vec![1024, 1024];
         let f_out = File::create(&f_out_path).unwrap();
-        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, false, split);
-        cio.write_output_split(&buf).unwrap();
-        cio.write_output_split(&buf).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, vec![], split);
+        cio.write_files(&buf).unwrap();
+        cio.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 1024);  
         assert!(fs::metadata("test_split_out.c02").is_err());          
@@ -489,8 +576,8 @@ mod tests {
         // split sizes overflow buffer size
         let split = vec![1, 1024, 12];
         let f_out = File::create(&f_out_path).unwrap();
-        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, false, split);
-        cio.write_output_split(&buf).unwrap();
+        let mut cio = CryptIo::new(f_in.try_clone().unwrap(), f_in_path.clone(), 0, f_out.try_clone().unwrap(), f_out_path.clone(), 0, vec![], split);
+        cio.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 1023);  
         assert!(fs::metadata("test_split_out.c03").is_err()); 
@@ -761,6 +848,7 @@ mod tests {
         Encryption::encrypt(&filepath_in, None, false, vec![1048576, 12]).unwrap();
         // backup by renaming
         fs::rename(&filepath_in, &filepath_org).unwrap();
+
         // concatenate spilt output files
         let mut data_concat = fs::read("test_cc_split.bin.c00").unwrap();
         data_concat.extend(fs::read("test_cc_split.bin.c01").unwrap());
@@ -768,10 +856,18 @@ mod tests {
         fs::write(&filepath_out, &data_concat).unwrap();
 
         Decryption::decrypt(&filepath_out, None).unwrap();
-
         // read and compare decrypted file against backup
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
+
+        // concatenate files with decrypt
+        let _ = fs::remove_file(&filepath_in);
+        let _ = fs::remove_file(&filepath_out);
+        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None).unwrap();
+        // read and compare decrypted file against backup
+        let decrypt_data = fs::read(&filepath_in).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
 
         // cleanup
         let _ = fs::remove_file(&filepath_in);
