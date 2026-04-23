@@ -1,7 +1,6 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
-use std::thread;
 use rpassword::{prompt_password, read_password_from_bufread};
 use std::io::Cursor;
 use hkdf::Hkdf;
@@ -37,7 +36,6 @@ fn get_password_from_user(verify: bool) -> Result<SecretString> {
         }
     );
 
-    
     if verify {
         let password_rep = SecretString::from( 
             if cfg!(test) {
@@ -135,123 +133,6 @@ pub fn key_derivation(key: &SecretSlice<u8>, salt: &[u8], info: &[u8]) -> Result
     hk.expand(info, okm.expose_secret_mut())
         .map_err(|e| format!("Invalid length for HKDF expand: {:?}", e))?;
     Ok(okm)
-}
-
-/// Parameters for file operations during cryptographic processing.
-pub struct CryptIo {
-    /// Input file to read data from
-    f_in: File, 
-    /// Output file to write processed data to
-    f_out: File,
-    /// Total size in bytes of input data remaining to be read
-    f_in_size_remaining: u64, 
-    /// Size in bytes of each chunk to process per iteration
-    chunk_size: usize,
-    /// Compress data before encryption
-    compress: bool,
-}
-
-impl CryptIo {
-
-    pub fn new(f_in: File, f_out: File, f_in_size_remaining: u64, chunk_size: usize, compress: bool) -> Self {
-        Self { f_in, f_out, f_in_size_remaining, chunk_size, compress }
-    }
-
-    /// Calculate how much data is left in the input file, how much need to be read for the current chunk 
-    /// and whether it is the final chunk. 
-    /// 
-    /// The remaining bytes to be read is updated in this method (`self.f_in_size_remaining`).
-    /// If compression is used, the chunk size varies. The size is coded in the 3 bytes 
-    /// at the start of a chunk in little endian order.
-    /// 
-    /// # Returns
-    /// - `Ok((read_size, final_chunk))` chunk size to be read and if it is the final chunk
-    /// - `Err` if file I/O or variable conversion fails 
-    fn input_sizes(&mut self) -> Result<(usize, bool)> {
-        let cuk_size = if self.chunk_size == 0 {
-            // dynamic chunk size (if compression is used)
-            let mut buf = [0u8; AES_LENGTH_SIZE];
-            self.f_in.read_exact(&mut buf)?;
-            self.f_in_size_remaining -= buf.len() as u64;
-            let c_size: [u8; 4] = [&buf[..], &[0]].concat().try_into().unwrap();
-            u32::from_le_bytes(c_size)
-        } else {
-            // fixed chunk size
-            u32::try_from(self.chunk_size)?
-        };
-
-        let (read_size, final_chunk) = 
-            if self.f_in_size_remaining <= u64::from(cuk_size) {
-                // final chunk
-                (u32::try_from(self.f_in_size_remaining)?, true)
-            } else {
-                (cuk_size, false)
-            };
-
-        self.f_in_size_remaining -= u64::from(read_size);
-
-        Ok((read_size as usize, final_chunk))
-    }
-
-    /// Performs cryptographic I/O operations on a file using chunked processing with multithreading.
-    ///
-    /// Reads input file in chunks, applies two sequential cryptographic functions to each chunk
-    /// using parallelism by threads and writes the results.
-    ///
-    /// # Arguments
-    /// - `fp`: file parameters
-    /// - `key1`: Cryptographic key for processing with first cryptographic function
-    /// - `key2`: Cryptographic key for processing with second cryptographic function
-    /// - `crypt_fn1`: First cryptographic function (e.g., first-pass encryption)
-    /// - `crypt_fn2`: Second cryptographic function (e.g., second-pass encryption)
-    ///
-    /// # Returns
-    /// - `Ok(())` on successful completion
-    /// - `Err` if file I/O fails or cryptographic functions fail
-    #[allow(clippy::type_complexity)]
-    pub fn io_chunks(
-        &mut self,
-        key_cha: &SecretSlice<u8>, 
-        key_aes: &SecretSlice<u8>,
-        crypt_fn: fn(&SecretSlice<u8>, &SecretSlice<u8>, &[u8], u32, bool, bool) -> Result<Vec<u8>>
-    ) -> Result<()> 
-    {
-        let cpu_count = num_cpus::get();
-        let mut chunk_count: u32 = 0;  
-        let compress = self.compress;
-
-        while self.f_in_size_remaining > 0 {
-            let mut child_threads = Vec::with_capacity(cpu_count);
-
-            for _ in 0..cpu_count {
-                let key_cha = key_cha.clone();
-                let key_aes = key_aes.clone();
-
-                let (read_size, final_chunk) = self.input_sizes()?;
-
-                let mut buf_in = vec![0u8; read_size];
-                self.f_in.read_exact(&mut buf_in)?;
-
-                child_threads.push(thread::spawn(move || {
-                        let buf_out = crypt_fn(&key_cha, &key_aes, &buf_in, chunk_count, final_chunk, compress)
-                            .map_err(|e| e.to_string())?;
-                        Ok::<Vec<u8>, String>(buf_out)
-                    }));
-                
-                if self.f_in_size_remaining == 0 {
-                    break;
-                } 
-                chunk_count += 1;
-            }
-
-            for child in child_threads {
-                let buf_out = child.join().unwrap()?;
-                self.f_out.write_all(&buf_out)?;
-            }
-        }
-        
-        Ok(())
-    }
 }
 
 
@@ -447,7 +328,6 @@ mod tests {
         let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data_big, 0, false).unwrap();
         let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
         assert_eq!(data_big, decrypt_data[..]);
-
     }
 
     #[test]
@@ -502,127 +382,5 @@ mod tests {
         assert!(!out_z.is_empty());
         let dat_out = Decryption::decompress_buffer(&out_z).unwrap();
         assert!(dat_out.is_empty());
-    }
-
-    #[test]
-    fn test_crypt_pipe() {
-        let key_cha: [u8; 32]  = rand::random();
-        let key_cha = SecretSlice::from(key_cha.to_vec());
-        let key_aes: [u8; 32]  = rand::random();
-        let key_aes = SecretSlice::from(key_aes.to_vec());
-        let data: [u8; 100] = rand::random();
-
-        // with compression
-        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, true).unwrap();
-        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, true).unwrap();
-        assert_eq!(data, &out_dec[..]);
-        // check length info in encrypted data
-        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
-        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
-
-        // without compression
-        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, false).unwrap();
-        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, false).unwrap();
-        assert_eq!(data, &out_dec[..]);
-        // check length info in encrypted data
-        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
-        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
-    }
-
-    #[test]
-    fn test_crypt() {
-        // create file with random data for encryption
-        let filepath_in = PathBuf::from("test_cc.bin");
-        let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
-        let mut filepath_org = filepath_in.clone();
-        filepath_org.add_extension("org");
-
-        
-        let mut data = vec![0; 1024 * 3000];
-        rand::rng().fill_bytes(&mut data);
-        fs::write(&filepath_in, &data).unwrap();
-
-        assert_eq!(get_password_from_user(false).unwrap().expose_secret(), "abc123test");
-
-        // encrypt, backup original file, decrypt
-        Encryption::encrypt(&filepath_in, None, false).unwrap();
-        // encrypted file must be different than original data
-        assert_ne!(data, fs::read(&filepath_out).unwrap());
-        // backup by renaming
-        fs::rename(&filepath_in, &filepath_org).unwrap();
-        Decryption::decrypt(&filepath_out, None).unwrap();
-
-        // read and compare decrypted file against backup
-        let decrypt_data = fs::read(&filepath_in).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        // decrypt with keyfile
-        let filepath_kf = PathBuf::from("test_another_key.bin");
-        fs::write(&filepath_kf, vec![0; 1024]).unwrap();
-        assert!(Decryption::decrypt(&filepath_out, Some(&filepath_kf)).is_err());
-
-        // cleanup
-        let _ = fs::remove_file(&filepath_in);
-        let _ = fs::remove_file(&filepath_out);
-        let _ = fs::remove_file(&filepath_org);
-        let _ = fs::remove_file(&filepath_kf);
-    }
-
-    #[test]
-    fn test_crypt_with_keyfile() {
-        // create file with random data for encryption
-        let filepath_in = PathBuf::from("test_cc_kf.bin");
-        let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
-        let mut filepath_org = filepath_in.clone();
-        filepath_org.add_extension("org");
-        let filepath_kf = PathBuf::from("test_key.bin");
-        
-        let mut data = vec![0; 1024 * 1024];
-        rand::rng().fill_bytes(&mut data);
-        fs::write(&filepath_in, &data).unwrap();
-
-        let mut data_kf = vec![0; 1024 * 1024 * 2];
-        rand::rng().fill_bytes(&mut data_kf);
-        fs::write(&filepath_kf, &data_kf).unwrap();
-
-        // use keyfile, encrypt, backup original file, decrypt
-        Encryption::encrypt(&filepath_in, Some(&filepath_kf), false).unwrap();
-        fs::rename(&filepath_in, &filepath_org).unwrap();
-        Decryption::decrypt(&filepath_out, Some(&filepath_kf)).unwrap();
-
-        // read and compare decrypted file against backup
-        let decrypt_data = fs::read(&filepath_in).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        // decrypt without key file
-        assert!(Decryption::decrypt(&filepath_out, None).is_err());
-
-        // key file does not exist
-        assert!(Encryption::encrypt(&filepath_in, Some(&PathBuf::from("test_miss")), false).is_err());
-        assert!(Decryption::decrypt(&filepath_out, Some(&PathBuf::from("test_miss"))).is_err());
-
-        // input file does not exist
-        assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None, false).is_err());
-        assert!(Decryption::decrypt(&PathBuf::from("test_miss"), None).is_err());
-
-        // cleanup
-        let _ = fs::remove_file(&filepath_in);
-        let _ = fs::remove_file(&filepath_out);
-        let _ = fs::remove_file(&filepath_org);
-        let _ = fs::remove_file(&filepath_kf);
-    }
-
-    #[test]
-    #[ignore="only for benchmarking"]
-    fn test_crypt_bench() {
-        // a file 'ttt' must already exist
-        let filepath_in = PathBuf::from("ttt");     
-        let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
-
-        Encryption::encrypt(&filepath_in, None, false).unwrap();
-        Decryption::decrypt(&filepath_out, None).unwrap();
     }
 }

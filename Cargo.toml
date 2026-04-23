@@ -11,6 +11,7 @@ chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.60", features = ["derive"] }
 hkdf = "0.13.0"
 num_cpus = "1.17.0"
+parse-size = "1.1.0"
 rand = "0.10.0"
 rand_chacha = "0.10.0"
 rpassword = "7.4.0"

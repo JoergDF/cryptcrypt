@@ -1,6 +1,5 @@
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305};
 use rand::{Rng, SeedableRng};
@@ -12,7 +11,8 @@ use bzip2::Compression;
 use bzip2::read::BzEncoder;
 
 use crate::*;
-use crate::common::{get_pass_bytes, key_derivation, CryptIo};
+use crate::common::{get_pass_bytes, key_derivation};
+use crate::common_io::{CryptIo, ReadInput, WriteOutput};
 
 
 /// Handles file encryption operations using dual-layer encryption.
@@ -159,7 +159,6 @@ impl Encryption {
         Ok(combined_data)
     }
 
-
     /// Compresses a byte buffer using bzip2 compression.
     ///
     /// Uses bzip2 with best compression level to compress the provided input
@@ -213,53 +212,60 @@ impl Encryption {
     ///
     /// Prompts user for password, derives master key using Argon2, derives keys for 
     /// ChaCha20 and AES-256-GCM-SIV, compresses (on demand) and encrypts the file in
-    /// chunks across multiple threads. Output file gets `.cce` extension.
-    ///
+    /// chunks across multiple threads. Output file gets `.cce` extension. Or output can 
+    /// be split into several files, which get extensions `.c00`, `.c01`, `.c02`, ...
+    /// 
     /// # Arguments
     /// - `filepath_in`: Path to input file to encrypt
     /// - `keyfilepath`: Optional path to an additional key file
     /// - `compress`: Compress input file before encryption
+    /// - `split`: List of output split sizes; if empty, no split is done.
     ///
     /// # Returns
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
-    pub fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>, compress: bool) -> Result<()> {
-        let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
-    
-        let f_in  = File::open(filepath_in)?;
+    pub fn encrypt(filepath_in: &Path, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>) -> Result<()> {
+        let mut filepath_out = filepath_in.to_path_buf();
+        if split.is_empty() {
+            filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        } else {
+            filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
+        }
 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
-
-        let mut f_out = File::create(filepath_out)?;
 
         // file header
         //   byte  description
         //      0  version of file format
         //      1  info about file format
-        //         bit 0: compression on(1)/off(0)
-        //  2..33  32-byte-salt of passwort hash
+        //           bit 0: compression on(1)/off(0)
+        //  2..33  32-byte-salt of password hash
         // 34..65  32-byte-salt of cha key derivation
         // 66..97  32-byte-salt of aes key derivation
-        f_out.write_all(&[FILE_FORMAT_VERSION])?;
-        let file_format = [u8::from(compress)];
-        f_out.write_all(&file_format)?;
-        f_out.write_all(&salt_pw)?;
-        f_out.write_all(&salt_cha)?;
-        f_out.write_all(&salt_aes)?;
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+        header.push(FILE_FORMAT_VERSION);
+        header.push(u8::from(compress));
+        header.extend(salt_pw);
+        header.extend(salt_cha);
+        header.extend(salt_aes);
 
-        // set file parameters
-        let f_in_size = f_in.metadata()?.len();
+        // set read parameters
+        let read_input = ReadInput::new(filepath_in.to_path_buf(), CHUNK_SIZE, 0)?;
+
+         // set write parameters and create output file
+        let mut write_output = WriteOutput::new(filepath_out, split)?;
+
+        // write header
+        write_output.write_files(&header)?;
+
+        // set crypto parameters
         let mut cio = CryptIo::new (
-            f_in, 
-            f_out, 
-            f_in_size, 
-            CHUNK_SIZE,
-            compress,
+            read_input,
+            write_output,
         );
 
-        cio.io_chunks(&key_cha, &key_aes, Self::encrypt_pipe)?;
+        cio.io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe)?;
 
         Ok(())
     }
@@ -273,6 +279,7 @@ impl Encryption {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_hash_password_encrypt() {
@@ -321,6 +328,171 @@ mod tests {
         assert_ne!(salt_aes, salt_aes2);
         assert_ne!(key_cha.expose_secret(), key_cha2.expose_secret());
         assert_ne!(key_aes.expose_secret(), key_aes2.expose_secret());
+    }
 
+    #[test]
+    fn test_crypt_pipe() {
+        let key_cha: [u8; 32]  = rand::random();
+        let key_cha = SecretSlice::from(key_cha.to_vec());
+        let key_aes: [u8; 32]  = rand::random();
+        let key_aes = SecretSlice::from(key_aes.to_vec());
+        let data: [u8; 100] = rand::random();
+
+        // with compression
+        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, true).unwrap();
+        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, true).unwrap();
+        assert_eq!(data, &out_dec[..]);
+        // check length info in encrypted data
+        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
+        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
+
+        // without compression
+        let out_enc = Encryption::encrypt_pipe(&key_cha, &key_aes, &data, 10, false, false).unwrap();
+        let out_dec = Decryption::decrypt_pipe(&key_cha, &key_aes, &out_enc[3..], 10, false, false).unwrap();
+        assert_eq!(data, &out_dec[..]);
+        // check length info in encrypted data
+        let size: [u8; 4] = [&out_enc[..3], &[0]].concat().try_into().unwrap();
+        assert_eq!(u32::from_le_bytes(size), out_enc[3..].len() as u32);
+    }
+
+    #[test]
+    fn test_crypt() {
+        // create file with random data for encryption
+        let filepath_in = PathBuf::from("test_cc.bin");
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        let mut filepath_org = filepath_in.clone();
+        filepath_org.add_extension("org");
+
+        // create random input file
+        let mut data = vec![0; 1024 * 3000];
+        rand::rng().fill_bytes(&mut data);
+        fs::write(&filepath_in, &data).unwrap();
+
+        // encrypt, backup original file, decrypt
+        Encryption::encrypt(&filepath_in, None, false, vec![]).unwrap();
+        // encrypted file must be different than original data
+        assert_ne!(data, fs::read(&filepath_out).unwrap());
+        // backup by renaming
+        fs::rename(&filepath_in, &filepath_org).unwrap();
+        Decryption::decrypt(&filepath_out, None).unwrap();
+
+        // read and compare decrypted file against backup
+        let decrypt_data = fs::read(&filepath_in).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
+        // decrypt with keyfile should fail
+        let filepath_kf = PathBuf::from("test_another_key.bin");
+        fs::write(&filepath_kf, vec![0; 1024]).unwrap();
+        assert!(Decryption::decrypt(&filepath_out, Some(&filepath_kf)).is_err());
+
+        // cleanup
+        let _ = fs::remove_file(&filepath_in);
+        let _ = fs::remove_file(&filepath_out);
+        let _ = fs::remove_file(&filepath_org);
+        let _ = fs::remove_file(&filepath_kf);
+    }
+
+     #[test]
+    fn test_crypt_with_keyfile() {
+        // create file with random data for encryption
+        let filepath_in = PathBuf::from("test_cc_kf.bin");
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        let mut filepath_org = filepath_in.clone();
+        filepath_org.add_extension("org");
+        let filepath_kf = PathBuf::from("test_key.bin");
+        
+        let mut data = vec![0; 1024 * 1024];
+        rand::rng().fill_bytes(&mut data);
+        fs::write(&filepath_in, &data).unwrap();
+
+        let mut data_kf = vec![0; 1024 * 1024 * 2];
+        rand::rng().fill_bytes(&mut data_kf);
+        fs::write(&filepath_kf, &data_kf).unwrap();
+
+        // use keyfile, encrypt, backup original file, decrypt
+        Encryption::encrypt(&filepath_in, Some(&filepath_kf), false, vec![]).unwrap();
+        fs::rename(&filepath_in, &filepath_org).unwrap();
+        Decryption::decrypt(&filepath_out, Some(&filepath_kf)).unwrap();
+
+        // read and compare decrypted file against backup
+        let decrypt_data = fs::read(&filepath_in).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
+        // decrypt without key file
+        assert!(Decryption::decrypt(&filepath_out, None).is_err());
+
+        // key file does not exist
+        assert!(Encryption::encrypt(&filepath_in, Some(&PathBuf::from("test_miss")), false, vec![]).is_err());
+        assert!(Decryption::decrypt(&filepath_out, Some(&PathBuf::from("test_miss"))).is_err());
+
+        // input file does not exist
+        assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None, false, vec![]).is_err());
+        assert!(Decryption::decrypt(&PathBuf::from("test_miss"), None).is_err());
+
+        // cleanup
+        let _ = fs::remove_file(&filepath_in);
+        let _ = fs::remove_file(&filepath_out);
+        let _ = fs::remove_file(&filepath_org);
+        let _ = fs::remove_file(&filepath_kf);
+    }
+
+    #[test]
+    fn test_crypt_split() {
+        let filepath_in = PathBuf::from("test_cc_split.bin");
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+        let mut filepath_org = filepath_in.clone();
+        filepath_org.add_extension("org");
+
+        // create random input file
+        let mut data = vec![0; 1024 * 3000];
+        rand::rng().fill_bytes(&mut data);
+        fs::write(&filepath_in, &data).unwrap();
+
+        Encryption::encrypt(&filepath_in, None, false, vec![1048576, 12]).unwrap();
+        // backup by renaming
+        fs::rename(&filepath_in, &filepath_org).unwrap();
+
+        // concatenate spilt output files
+        let mut data_concat = fs::read("test_cc_split.bin.c00").unwrap();
+        data_concat.extend(fs::read("test_cc_split.bin.c01").unwrap());
+        data_concat.extend(fs::read("test_cc_split.bin.c02").unwrap());
+        fs::write(&filepath_out, &data_concat).unwrap();
+
+        Decryption::decrypt(&filepath_out, None).unwrap();
+        // read and compare decrypted file against backup
+        let decrypt_data = fs::read(&filepath_in).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
+        // concatenate files with decrypt
+        let _ = fs::remove_file(&filepath_in);
+        let _ = fs::remove_file(&filepath_out);
+        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None).unwrap();
+        // read and compare decrypted file against backup
+        let decrypt_data = fs::read(&filepath_in).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
+
+        // cleanup
+        let _ = fs::remove_file(&filepath_in);
+        let _ = fs::remove_file(&filepath_out);
+        let _ = fs::remove_file(&filepath_org);
+        let _ = fs::remove_file("test_cc_split.bin.c00");
+        let _ = fs::remove_file("test_cc_split.bin.c01");
+        let _ = fs::remove_file("test_cc_split.bin.c02");
+    }
+
+    #[test]
+    #[ignore="only for benchmarking"]
+    fn test_crypt_bench() {
+        // a file 'ttt' must already exist
+        let filepath_in = PathBuf::from("ttt");     
+        let mut filepath_out = filepath_in.clone();
+        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
+
+        Encryption::encrypt(&filepath_in, None, false, vec![]).unwrap();
+        Decryption::decrypt(&filepath_out, None).unwrap();
     }
 }
