@@ -336,14 +336,14 @@ mod tests {
         let mut ri = ReadInput::new(PathBuf::from(test_file), 50, 10).unwrap();
         let (read_size, final_chunk) = ri.input_sizes().unwrap();
         assert_eq!(read_size, 50);
-        assert_eq!(final_chunk, false);
+        assert!(!final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 40);
 
         // Case 2: Static chunk, final
         // Continuing from above: remaining 40. Chunk 50.
         let (read_size, final_chunk) = ri.input_sizes().unwrap();
         assert_eq!(read_size, 40);
-        assert_eq!(final_chunk, true);
+        assert!(final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 0);
         
         // --- Dynamic chunk size ---
@@ -360,7 +360,7 @@ mod tests {
         // cuk_size is 16. 97 > 16, so not final.
         // read_size = 16. remaining: 97 - 16 = 81.
         assert_eq!(read_size, 16);
-        assert_eq!(final_chunk, false);
+        assert!(!final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 81);
 
         // Case 4: Dynamic chunk, final
@@ -376,7 +376,7 @@ mod tests {
         // cuk_size is 80. 7 <= 80, so final.
         // read_size = 7. remaining: 7 - 7 = 0.
         assert_eq!(read_size, 7);
-        assert_eq!(final_chunk, true);
+        assert!(final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 0);
 
         // cleanup
@@ -508,17 +508,17 @@ mod tests {
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 40);
         assert_eq!(buf, vec![1u8; 40]);
-        assert_eq!(final_chunk, false);
+        assert!(!final_chunk);
 
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 40);
         assert_eq!(buf, vec![1u8; 40]);
-        assert_eq!(final_chunk, false);
+        assert!(!final_chunk);
 
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 10);
         assert_eq!(buf, vec![1u8; 10]);
-        assert_eq!(final_chunk, true);
+        assert!(final_chunk);
 
         // --- Dynamic chunk size ---
         // Each chunk starts with 3 bytes (LE) length.
@@ -535,12 +535,12 @@ mod tests {
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 5);
         assert_eq!(buf, vec![2u8; 5]);
-        assert_eq!(final_chunk, false);
+        assert!(!final_chunk);
 
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 2);
         assert_eq!(buf, vec![3u8; 2]);
-        assert_eq!(final_chunk, true);
+        assert!(final_chunk);
 
         // cleanup
         let _ = fs::remove_file(test_file);
