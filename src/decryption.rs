@@ -1,5 +1,4 @@
-use std::fs::{self, File};
-use std::io::Read;
+use std::{io::Read, path::Path};
 use std::path::PathBuf;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
@@ -8,7 +7,8 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::read::BzDecoder;
 
 use crate::*;
-use crate::common::{get_pass_bytes, key_derivation, CryptIo};
+use crate::common::{get_pass_bytes, key_derivation};
+use crate::common_io::{CryptIo, ReadInput, WriteOutput};
 
 
 /// Handles file decryption operations using dual-layer decryption.
@@ -177,8 +177,8 @@ impl Decryption {
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    pub fn decrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>) -> Result<()> {
-        let mut filepath_out = filepath_in.clone();
+    pub fn decrypt(filepath_in: &Path, keyfilepath: Option<&PathBuf>) -> Result<()> {
+        let mut filepath_out = filepath_in.to_path_buf();
         if filepath_in.extension() == Some(std::ffi::OsStr::new(ENCRYPTED_FILE_EXT)) ||
            filepath_in.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
             // remove encrypted-file-extension
@@ -187,45 +187,15 @@ impl Decryption {
             return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT} or .{SPLIT_ENC_FILE_EXT}").into())
         }
 
-        let f_in = File::open(filepath_in)?;
-        
-        let mut header = [0u8; 2 + 3 * SALT_SIZE];
+        // set read parameters
+        let mut read_input = ReadInput::new(filepath_in.to_path_buf(), 0, HEADER_SIZE)?;
 
-        // create output file
-        let f_out = File::create(filepath_out.clone())?;
-
-        // splitted files: get sum of file sizes and fill split list with file sizes
-        let mut file_in_size = 0;
-        let mut split = vec![];
-        if filepath_in.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
-            let mut split_index = 0;
-            let mut f_path = filepath_in.clone();
-            
-            while let Ok(meta) = fs::metadata(&f_path) {
-                file_in_size += meta.len();
-                split.push(meta.len());
-                split_index += 1;
-                f_path.set_extension(format!("c{:02}", split_index));
-            }
-        } else {
-            file_in_size = f_in.metadata()?.len();
-        }
-
-        // set parameters
-        let f_in_size = file_in_size - header.len() as u64;
-        let mut cio = CryptIo::new (
-            f_in,
-            filepath_in.clone(),
-            f_in_size, 
-            f_out, 
-            filepath_out,
-            0,
-            split,
-            vec![]
-        );
+        // set write parameters and create output file
+        let write_output = WriteOutput::new(filepath_out, vec![])?;
 
         // Read file header
-        cio.read_files(&mut header)?;
+        let mut header = [0u8; HEADER_SIZE];
+        read_input.read_files(&mut header)?;
 
         let file_format_version = header[0];
         let file_format         = header[1];
@@ -244,13 +214,14 @@ impl Decryption {
         let key = Self::hash_password(salt_pw, keyfilepath)?;
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
 
-        let compressed = (file_format & 0x01) != 0;
-        cio.io_chunks(
-            &key_cha,
-            &key_aes,
-            compressed,
-            Self::decrypt_pipe 
-        )?;
+        // set crypto parameters
+        let mut cio = CryptIo::new (
+            read_input,
+            write_output
+        );
+
+        let compress = (file_format & 0x01) != 0;
+        cio.io_chunks(&key_cha, &key_aes, compress, Self::decrypt_pipe)?;
 
         Ok(())
     }

@@ -11,6 +11,7 @@ use crate::decryption::Decryption;
 
 
 mod common;
+mod common_io;
 mod encryption;
 mod decryption;
 
@@ -23,6 +24,7 @@ const MAX_KEYFILE_CHUNKS: usize = 64;
 const SALT_SIZE: usize          = 32; 
 const KEY_SIZE: usize           = 32;
 const AES_LENGTH_SIZE: usize    = 3;
+const HEADER_SIZE: usize        = 2 + 3 * SALT_SIZE;
 const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USIZE;      // 12 bytes
 const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
 #[cfg(test)]
