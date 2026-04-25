@@ -66,25 +66,12 @@ struct Args {
 
 /// Main entry point for the cryptcrypt application.
 ///
-/// Parses command-line arguments and dispatches to either encryption or decryption
-/// based on the provided flags.
-///
 /// # Returns
 /// - `ExitCode::SUCCESS` on successful completion
 /// - `ExitCode::FAILURE` if an error occurs during encryption/decryption
 /// 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    
-    let filepath = args.file;
-    let keyfilepath = args.keyfile;
-
-    let result = 
-        if args.decrypt {
-            Decryption::decrypt(&filepath, keyfilepath.as_ref())
-        } else {
-            Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)
-        };
+    let result = run();
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -93,4 +80,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Run the code.
+/// 
+/// Parses command-line arguments and dispatches to either encryption or decryption
+/// based on the provided flags.
+fn run() -> Result<()> {
+    let args = Args::parse();
+ 
+    let filepath = args.file.canonicalize()?;
+    let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
+
+    if args.decrypt {
+        Decryption::decrypt(&filepath, keyfilepath.as_ref())?
+    } else {
+        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?
+    }
+
+    Ok(())
 }

@@ -44,7 +44,7 @@ impl ReadInput {
             let mut split_idx = 0;
             let mut f_path = f_in_path.clone();
             
-            while let Ok(meta) = std::fs::metadata(&f_path) {
+            while let Ok(meta) = f_path.metadata() {
                 let file_size = meta.len();
                 f_in_size += file_size;
                 f_in_split.push(file_size);
