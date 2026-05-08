@@ -23,13 +23,11 @@ const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
 const MAX_KEYFILE_CHUNKS: usize = 64;
 const SALT_SIZE: usize          = 32; 
 const KEY_SIZE: usize           = 32;
-const AES_LENGTH_SIZE: usize    = 3;
+const COMPRESS_LENGTH_SIZE: usize = 3;
 const HEADER_SIZE: usize        = 2 + 3 * SALT_SIZE;
 const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USIZE;      // 12 bytes
 const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
-#[cfg(test)]
 const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;        // 16 bytes
-#[cfg(test)]
 const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;   // 16 bytes
 
 
@@ -68,8 +66,7 @@ struct Args {
 ///
 /// # Returns
 /// - `ExitCode::SUCCESS` on successful completion
-/// - `ExitCode::FAILURE` if an error occurs during encryption/decryption
-/// 
+/// - `ExitCode::FAILURE` if an error occurs 
 fn main() -> ExitCode {
     let result = run();
 
@@ -93,9 +90,9 @@ fn run() -> Result<()> {
     let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
 
     if args.decrypt {
-        Decryption::decrypt(&filepath, keyfilepath.as_ref())?
+        Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
     } else {
-        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?
+        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?;
     }
 
     Ok(())

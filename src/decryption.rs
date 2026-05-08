@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::thread;
 use std::{io::Read, path::Path};
 use std::path::PathBuf;
 use argon2::Argon2;
@@ -5,13 +7,14 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use aes_gcm_siv::{aead::{Aead, KeyInit}, Aes256GcmSiv, Nonce};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::read::BzDecoder;
+use crossbeam_channel::{bounded, Sender, Receiver};
 
 use crate::*;
 use crate::common::{get_pass_bytes, key_derivation};
 use crate::common_io::{CryptIo, ReadInput, WriteOutput};
 
 
-/// Handles file decryption operations using dual-layer decryption.
+/// Handles file decryption operations using dual-layer decryption and decompression.
 ///
 /// Reverses ChaCha20-Poly1305 and AES-256-GCM-SIV encryption applied during encryption.
 pub struct Decryption;
@@ -133,35 +136,197 @@ impl Decryption {
         let mut decompressor = BzDecoder::new(buf);
         let mut decompressed_data = Vec::with_capacity(CHUNK_SIZE);
         decompressor.read_to_end(&mut decompressed_data)?;
+
         Ok(decompressed_data)
     }
 
-    /// Reverse the encryption pipeline for a single chunk: AES then ChaCha, optional decompress.
+    /// Re-segments a stream of decrypted fixed-sized fragments into length-prefixed compressed chunks.
     ///
-    /// This function takes the AES-encrypted input, decrypts it using AES-256-GCM-SIV,
-    /// then decrypts the inner ChaCha20-Poly1305 ciphertext, and finally optionally
-    /// decompresses the resulting plaintext. It mirrors `Encryption::encrypt_pipe`.
+    /// Reads decrypted fragment payloads from `rx_e` (items are `(Vec<u8>, chunk_index)`),
+    /// reorders out-of-order fragments using a `BTreeMap`, concatenates payloads into an
+    /// internal buffer and extracts complete compressed entries using the compact length
+    /// prefix encoded in the first `COMPRESS_LENGTH_SIZE` bytes. Each extracted compressed
+    /// entry is emitted to `tx_c` as `(Vec<u8>, new_chunk_count)`.
+    ///
+    /// Implementation details:
+    /// - Uses `pending_chunks: BTreeMap<u32, Vec<u8>>` to hold fragments until their turn.
+    /// - Maintains `out_index` to stream fragments in increasing original order.
+    /// - Keeps `buf_out` as a rolling buffer; reads the length prefix (little-endian,
+    ///   `COMPRESS_LENGTH_SIZE` bytes) to determine the expected compressed-entry size,
+    ///   then slices off exactly that many bytes to form an output chunk.
+    /// - Uses `split_off` + `std::mem::replace` to avoid unnecessary copying when carving
+    ///   out chunks from `buf_out`.
+    /// - `new_chunk_count` is a sequential 0‑based counter for output chunks.
+    /// - Propagates errors (size conversions, channel sends) via the function `Result`.
     ///
     /// # Arguments
-    /// - `key_cha`: ChaCha key used for inner decryption
-    /// - `key_aes`: AES key used for outer decryption
-    /// - `buf_in`: input bytes (expected AES output: nonce + ciphertext + tag)
-    /// - `chunk_count`: zero-based chunk index (must match encryption)
-    /// - `final_chunk`: whether this is the last chunk (must match encryption)
-    /// - `decompress`: whether to decompress after decryption
+    /// - `rx_e`: receiver of decrypted buffers `(Vec<u8>, chunk_count)` produced by earlier stages.
+    /// - `tx_c`: sender for re-segmented compressed chunks `(Vec<u8>, new_chunk_count)`.
     ///
     /// # Returns
-    /// - `Ok(plaintext_bytes)` on success
-    /// - `Err` if any decryption or decompression step fails
-    pub fn decrypt_pipe(key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>, buf_in: &[u8], chunk_count: u32, final_chunk: bool, decompress: bool) -> Result<Vec<u8>> {
-        let buf_aes = Self::aes_decrypt_buffer(key_aes, buf_in)?;
-        let buf_cha = Self::cha_decrypt_buffer(key_cha, &buf_aes, chunk_count, final_chunk)?;
-        if decompress {
-            let buf_zip = Self::decompress_buffer(&buf_cha)?;
-            Ok(buf_zip)
-        } else {
-            Ok(buf_cha)
+    /// - `Ok(())` on successful re-segmentation and sending of all output chunks.
+    /// - `Err(...)` if a size conversion, IO, or channel send fails.
+    pub fn resegment(rx_e: Receiver<(Vec<u8>, u32)>, tx_c: Sender<(Vec<u8>, u32)>) -> Result<()> {
+        let mut pending_chunks = BTreeMap::new();
+        let mut out_index = 0;
+        let mut new_chunk_count: u32 = 0;
+        let mut buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
+        let mut compressed_chunk_len: Option<usize> = None;
+
+        for (buf_e, chunk_count) in rx_e {
+            pending_chunks.insert(chunk_count, buf_e);
+
+            while let Some(buf_in) = pending_chunks.remove(&out_index) {
+                buf_out.extend(buf_in);
+                out_index += 1;
+
+                loop {
+                    if let Some(c_chunk_len) = compressed_chunk_len {
+                        // length bytes have been read, check if buffer contains enough bytes
+                        if buf_out.len() >= c_chunk_len {
+                            let remainder = buf_out.split_off(c_chunk_len);
+                            let new_chunk = std::mem::replace(&mut buf_out, remainder);
+                            
+                            tx_c.send((new_chunk, new_chunk_count))?;
+
+                            compressed_chunk_len = None;
+                            new_chunk_count += 1;
+                        } else {
+                            break; // not enough data, get more
+                        }
+                    } else if buf_out.len() >= COMPRESS_LENGTH_SIZE {
+                        // get length bytes at the start of a compressed chunk
+                        let remainder = buf_out.split_off(COMPRESS_LENGTH_SIZE);
+                        let mut length_bytes = std::mem::replace(&mut buf_out, remainder);
+                        length_bytes.push(0);
+                        compressed_chunk_len = Some(
+                            u32::from_le_bytes(
+                                length_bytes.try_into().unwrap()
+                            ).try_into()?
+                        );
+                    } else {
+                        break; // not enough data, get more
+                    }
+                }
+            }
         }
+        
+        if !buf_out.is_empty() {
+            return Err("Decryption resegmentation end error".into());
+        }
+
+        Ok(())
+    }
+   
+    /// Creates the multithreaded decryption pipeline and returns thread handles.
+    ///
+    /// Spawns worker threads to reverse the encryption pipeline and produce plaintext chunks
+    /// for writing. Behavior depends on `decompress`:
+    /// - Always spawns `cpu_count` decryption threads: each reads `(Vec<u8>, chunk_count, final_flag)`
+    ///   from `rx_in`, performs AES-256-GCM-SIV decryption, then XChaCha20-Poly1305 decryption
+    ///   (reconstructing per-chunk nonce using `chunk_count` and `final_flag`), and sends
+    ///   `(Vec<u8>, chunk_count)`.
+    /// - If `decompress == true`:
+    ///   - Spawns a single re-segmentation thread that reads ordered decrypted inner payloads,
+    ///     stitches and parses length-prefixed compressed entries, and forwards `(Vec<u8>, u32)`
+    ///     to the decompression channel.
+    ///   - Spawns `cpu_count` decompression threads that read `(Vec<u8>, chunk_count)` from the
+    ///     re-segmentation output, decompress each entry, and send `(Vec<u8>, chunk_count)` to `tx_out`.
+    ///
+    /// Implementation details:
+    /// - Channels are bounded and cloned for each worker; senders are dropped
+    ///   where appropriate so receiver loops terminate cleanly.
+    /// - `key_cha` and `key_aes` are cloned into each thread.
+    /// - Each spawned thread returns `Result<(), String>`; the function returns a
+    ///   `Vec<thread::JoinHandle<std::result::Result<(), String>>>` so the caller can join
+    ///   and inspect thread results.
+    ///
+    /// # Arguments
+    /// - `key_cha`: ChaCha key used for inner decryption.
+    /// - `key_aes`: AES key used for outer decryption.
+    /// - `decompress`: enable resegment + decompression stages when true.
+    /// - `rx_in`: receiver for encrypted input chunks `(data, chunk_count, final_flag)`.
+    /// - `tx_out`: sender for final plaintext output `(plaintext_chunk, chunk_count)`.
+    /// - `cpu_count`: number of worker threads to spawn.
+    ///
+    /// # Returns
+    /// - `Vec<thread::JoinHandle<std::result::Result<(), String>>>` — handles for all spawned threads.
+    pub fn decrypt_pipe(
+        key_cha: &SecretSlice<u8>, 
+        key_aes: &SecretSlice<u8>, 
+        decompress: bool, 
+        rx_in: Receiver<(Vec<u8>, u32, bool)>, 
+        tx_out: Sender<(Vec<u8>, u32)>, 
+        cpu_count: usize
+    ) -> Vec<thread::JoinHandle<std::result::Result<(), String>>> {
+        
+        // number of threads used for decryption and decompression
+        let c_thread_cnt;
+        let e_thread_cnt;
+        if decompress {
+            c_thread_cnt = 1.max(cpu_count * 8 / 10);
+            e_thread_cnt = 1.max(cpu_count - c_thread_cnt);
+        } else {
+            c_thread_cnt = 0;
+            e_thread_cnt = cpu_count;
+        }
+
+        let (tx_e, rx_e) = bounded(cpu_count + 2);
+
+        let mut thread_handles = Vec::with_capacity(cpu_count * 2 + 1);
+
+        // decryption threads
+        for _ in 0..e_thread_cnt {
+            let key_cha = key_cha.clone();
+            let key_aes = key_aes.clone();
+            let rx_in = rx_in.clone();
+            let tx_e = if decompress { tx_e.clone() } else { tx_out.clone() };
+
+            thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> { 
+                for (buf_in, chunk_count, final_chunk) in rx_in {
+                    let buf_aes = Self::aes_decrypt_buffer(&key_aes, &buf_in).map_err(|e| e.to_string())?;
+                    let buf_cha = Self::cha_decrypt_buffer(&key_cha, &buf_aes, chunk_count, final_chunk).map_err(|e| e.to_string())?;
+                    tx_e.send((buf_cha, chunk_count)).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }));
+        }
+
+        drop(tx_e);
+
+        if decompress {
+            let (tx_c, rx_c) = bounded(cpu_count + 2);
+
+            // re-segmentation thread
+            {
+                let rx_e = rx_e.clone();
+                let tx_c= tx_c.clone();
+                thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> {  
+                    Self::resegment(rx_e, tx_c).map_err(|e| e.to_string())?;
+                    Ok(())
+                }));
+            }
+
+            drop(tx_c);
+
+            // decompression threads
+            for _ in 0..c_thread_cnt {
+                let rx_c = rx_c.clone();
+                let tx_out = tx_out.clone();
+
+                thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> {
+                    for (buf_in, chunk_count) in rx_c {
+                        let buf_zip = Self::decompress_buffer(&buf_in).map_err(|e| e.to_string())?;
+                        tx_out.send((buf_zip, chunk_count)).map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                }));
+            }
+
+            drop(tx_out);
+        }        
+
+        thread_handles
     }
 
     /// Decrypts a file encrypted with dual-layer encryption (AES-256-GCM-SIV + ChaCha20).
@@ -188,7 +353,11 @@ impl Decryption {
         }
 
         // set read parameters
-        let mut read_input = ReadInput::new(filepath_in.to_path_buf(), 0, HEADER_SIZE)?;
+        let mut read_input = ReadInput::new(
+            filepath_in.to_path_buf(), 
+            CHUNK_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE, 
+            HEADER_SIZE
+        )?;
 
         // set write parameters and create output file
         let write_output = WriteOutput::new(filepath_out, vec![])?;
@@ -214,14 +383,8 @@ impl Decryption {
         let key = Self::hash_password(salt_pw, keyfilepath)?;
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
 
-        // set crypto parameters
-        let mut cio = CryptIo::new (
-            read_input,
-            write_output
-        );
-
         let compress = (file_format & 0x01) != 0;
-        cio.io_chunks(&key_cha, &key_aes, compress, Self::decrypt_pipe)?;
+        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::decrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }
