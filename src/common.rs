@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 
-use crate::*;
+use crate::{Result, CHUNK_SIZE, MAX_KEYFILE_CHUNKS, KEY_SIZE};
 
 
 /// Prompts the user to enter a password from the terminal.
@@ -24,8 +24,8 @@ use crate::*;
 /// - `Err` if passwords don't match (when verify=true) or on I/O error
 fn get_password_from_user(verify: bool) -> Result<SecretString> {
     let password = SecretString::from(
-        if cfg!(test) {
-            println!("!!! Test-password used !!!");
+        if cfg!(test) || cfg!(fuzzing) {
+            if !cfg!(fuzzing) { println!("!!! Test-password used !!!"); }
             "abc123test".to_string()
         } else {
             prompt_password("Enter password: ")?
@@ -34,7 +34,7 @@ fn get_password_from_user(verify: bool) -> Result<SecretString> {
 
     if verify {
         let password_rep = SecretString::from( 
-            if cfg!(test) {
+            if cfg!(test) || cfg!(fuzzing) {
                 "abc123test".to_string()
             } else {
                 prompt_password("Repeat password: ")? 
@@ -141,6 +141,7 @@ mod tests {
     use super::*;
     use std::fs;
     use rand::Rng;
+    use crate::SALT_SIZE;
 
     #[test]
     fn test_get_password_from_user() {

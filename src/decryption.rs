@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
 use std::thread;
 use std::{io::Read, path::Path};
 use std::path::PathBuf;
+use std::collections::HashMap;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use aes_gcm_siv::{aead::{Aead, KeyInit}, Aes256GcmSiv, Nonce};
@@ -9,7 +9,8 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::read::BzDecoder;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
-use crate::*;
+use crate::{Result, KEY_SIZE, CHA_NONCE_SIZE, AES_NONCE_SIZE, CHUNK_SIZE, COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT,
+            SPLIT_ENC_FILE_EXT, CHA_TAG_SIZE, AES_TAG_SIZE, HEADER_SIZE, FILE_FORMAT_VERSION};
 use crate::common::{get_pass_bytes, key_derivation};
 use crate::common_io::{CryptIo, ReadInput, WriteOutput};
 
@@ -143,21 +144,10 @@ impl Decryption {
     /// Re-segments a stream of decrypted fixed-sized fragments into length-prefixed compressed chunks.
     ///
     /// Reads decrypted fragment payloads from `rx_e` (items are `(Vec<u8>, chunk_index)`),
-    /// reorders out-of-order fragments using a `BTreeMap`, concatenates payloads into an
+    /// reorders out-of-order fragments using a `HashMap`, concatenates payloads into an
     /// internal buffer and extracts complete compressed entries using the compact length
     /// prefix encoded in the first `COMPRESS_LENGTH_SIZE` bytes. Each extracted compressed
     /// entry is emitted to `tx_c` as `(Vec<u8>, new_chunk_count)`.
-    ///
-    /// Implementation details:
-    /// - Uses `pending_chunks: BTreeMap<u32, Vec<u8>>` to hold fragments until their turn.
-    /// - Maintains `out_index` to stream fragments in increasing original order.
-    /// - Keeps `buf_out` as a rolling buffer; reads the length prefix (little-endian,
-    ///   `COMPRESS_LENGTH_SIZE` bytes) to determine the expected compressed-entry size,
-    ///   then slices off exactly that many bytes to form an output chunk.
-    /// - Uses `split_off` + `std::mem::replace` to avoid unnecessary copying when carving
-    ///   out chunks from `buf_out`.
-    /// - `new_chunk_count` is a sequential 0‑based counter for output chunks.
-    /// - Propagates errors (size conversions, channel sends) via the function `Result`.
     ///
     /// # Arguments
     /// - `rx_e`: receiver of decrypted buffers `(Vec<u8>, chunk_count)` produced by earlier stages.
@@ -167,7 +157,7 @@ impl Decryption {
     /// - `Ok(())` on successful re-segmentation and sending of all output chunks.
     /// - `Err(...)` if a size conversion, IO, or channel send fails.
     pub fn resegment(rx_e: Receiver<(Vec<u8>, u32)>, tx_c: Sender<(Vec<u8>, u32)>) -> Result<()> {
-        let mut pending_chunks = BTreeMap::new();
+        let mut pending_chunks = HashMap::new();
         let mut out_index = 0;
         let mut new_chunk_count: u32 = 0;
         let mut buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
@@ -184,9 +174,7 @@ impl Decryption {
                     if let Some(c_chunk_len) = compressed_chunk_len {
                         // length bytes have been read, check if buffer contains enough bytes
                         if buf_out.len() >= c_chunk_len {
-                            let remainder = buf_out.split_off(c_chunk_len);
-                            let new_chunk = std::mem::replace(&mut buf_out, remainder);
-                            
+                            let new_chunk = buf_out.drain(..c_chunk_len).collect();
                             tx_c.send((new_chunk, new_chunk_count))?;
 
                             compressed_chunk_len = None;
@@ -196,8 +184,7 @@ impl Decryption {
                         }
                     } else if buf_out.len() >= COMPRESS_LENGTH_SIZE {
                         // get length bytes at the start of a compressed chunk
-                        let remainder = buf_out.split_off(COMPRESS_LENGTH_SIZE);
-                        let mut length_bytes = std::mem::replace(&mut buf_out, remainder);
+                        let mut length_bytes: Vec<u8> = buf_out.drain(..COMPRESS_LENGTH_SIZE).collect();
                         length_bytes.push(0);
                         compressed_chunk_len = Some(
                             u32::from_le_bytes(
@@ -233,14 +220,6 @@ impl Decryption {
     ///   - Spawns `cpu_count` decompression threads that read `(Vec<u8>, chunk_count)` from the
     ///     re-segmentation output, decompress each entry, and send `(Vec<u8>, chunk_count)` to `tx_out`.
     ///
-    /// Implementation details:
-    /// - Channels are bounded and cloned for each worker; senders are dropped
-    ///   where appropriate so receiver loops terminate cleanly.
-    /// - `key_cha` and `key_aes` are cloned into each thread.
-    /// - Each spawned thread returns `Result<(), String>`; the function returns a
-    ///   `Vec<thread::JoinHandle<std::result::Result<(), String>>>` so the caller can join
-    ///   and inspect thread results.
-    ///
     /// # Arguments
     /// - `key_cha`: ChaCha key used for inner decryption.
     /// - `key_aes`: AES key used for outer decryption.
@@ -271,7 +250,7 @@ impl Decryption {
             e_thread_cnt = cpu_count;
         }
 
-        let (tx_e, rx_e) = bounded(cpu_count + 2);
+        let (tx_e, rx_e) = bounded(cpu_count * 2);
 
         let mut thread_handles = Vec::with_capacity(cpu_count * 2 + 1);
 
@@ -292,10 +271,8 @@ impl Decryption {
             }));
         }
 
-        drop(tx_e);
-
         if decompress {
-            let (tx_c, rx_c) = bounded(cpu_count + 2);
+            let (tx_c, rx_c) = bounded(cpu_count * 2);
 
             // re-segmentation thread
             {
@@ -306,8 +283,6 @@ impl Decryption {
                     Ok(())
                 }));
             }
-
-            drop(tx_c);
 
             // decompression threads
             for _ in 0..c_thread_cnt {
@@ -322,8 +297,6 @@ impl Decryption {
                     Ok(())
                 }));
             }
-
-            drop(tx_out);
         }        
 
         thread_handles
@@ -401,6 +374,7 @@ mod tests {
     use super::*;
     use std::fs;
     use rand::Rng;
+    use crate::SALT_SIZE;
 
     #[test]
     fn test_hash_password_decrypt() {

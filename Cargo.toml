@@ -18,9 +18,12 @@ rand_chacha = "0.10.0"
 rpassword = "7.4.0"
 secrecy = "0.10.3"
 sha2 = "0.11.0"
-sha3 = "0.11.0"
+sha3 = "0.12.0"
 typenum = "1.19.0"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

@@ -11,9 +11,10 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::Compression;
 use bzip2::read::BzEncoder;
 use crossbeam_channel::{bounded, Sender, Receiver};
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
-use crate::*;
+use crate::{Result, SALT_SIZE, KEY_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, AES_NONCE_SIZE, AES_TAG_SIZE, CHUNK_SIZE, 
+            COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT, SPLIT_ENC_FILE_EXT, HEADER_SIZE, FILE_FORMAT_VERSION};
 use crate::common::{get_pass_bytes, key_derivation};
 use crate::common_io::{CryptIo, ReadInput, WriteOutput};
 
@@ -179,7 +180,7 @@ impl Encryption {
     /// - `Err` if compression or I/O fails
     pub fn compress_buffer(buf: &[u8]) -> Result<Vec<u8>> {
         let mut compressor = BzEncoder::new(buf, Compression::best());
-        let mut compressed_data = Vec::with_capacity(CHUNK_SIZE);
+        let mut compressed_data = Vec::with_capacity(CHUNK_SIZE + CHUNK_SIZE / 10);
         compressor.read_to_end(&mut compressed_data)?;
 
         Ok(compressed_data)
@@ -193,20 +194,7 @@ impl Encryption {
     /// internal buffer reaches or exceeds `CHUNK_SIZE` a `CHUNK_SIZE`-sized chunk is emitted
     /// to `tx_e` as `(Vec<u8>, new_chunk_count, new_final_chunk)`. Any remainder is kept and
     /// combined with subsequent fragments. After the input channel closes, any remaining data
-    /// is emitted as a final chunk (with `new_final_chunk = true`).
-    /// 
-    /// Implementation details:
-    /// - Uses a `BTreeMap` to hold out-of-order compressed fragments and to emit fragments in
-    ///   increasing sequence keyed by the original chunk index.
-    /// - Each compressed fragment is stored with a compact length prefix (first `COMPRESS_LENGTH_SIZE`
-    ///   bytes of `u32::to_le_bytes`), then the compressed payload, so the downstream stage can
-    ///   parse individual compressed entries inside a re-segmented chunk.
-    /// - `new_chunk_count` is a sequential counter for output chunks (0-based).
-    /// - `new_final_chunk` is set when the last input fragment has been processed and any
-    ///   remaining buffered bytes are emitted.
-    /// - Uses `split_off` + `std::mem::replace` to carve out exact `CHUNK_SIZE` slices without copying
-    ///   the remainder unnecessarily.
-    /// - Propagates any I/O/size conversion or channel send errors via the `Result` return value.
+    /// is emitted as a final chunk.
     /// 
     /// # Arguments
     /// - `rx_c`: receiver of compressed fragments `(Vec<u8>, u32, bool)`.
@@ -216,7 +204,7 @@ impl Encryption {
     /// - `Ok(())` on successful re-segmentation and sending of all output chunks.
     /// - `Err(...)` if a size conversion, IO, or channel send fails.
     pub fn resegment(rx_c: Receiver<(Vec<u8>, u32, bool)>, tx_e: Sender<(Vec<u8>, u32, bool)>) -> Result<()> {
-        let mut pending_chunks = BTreeMap::new();
+        let mut pending_chunks = HashMap::new();
         let mut out_index = 0;
         let mut new_chunk_count: u32 = 0;
         let mut new_final_chunk = false;
@@ -226,15 +214,14 @@ impl Encryption {
             pending_chunks.insert(chunk_count, (buf_zip, final_chunk));
 
             while let Some((buf_in, final_chunk)) = pending_chunks.remove(&out_index) {
-                // add length of compressed buffer before compressed buffer data
+                // add length of compressed data before compressed data
                 let buf_in_len: [u8; 4] = u32::try_from(buf_in.len())?.to_le_bytes();
                 buf_out.extend(&buf_in_len[..COMPRESS_LENGTH_SIZE]);
                 buf_out.extend(buf_in);
                 out_index += 1;
 
                 while buf_out.len() >= CHUNK_SIZE {
-                    let remainder = buf_out.split_off(CHUNK_SIZE);
-                    let new_chunk = std::mem::replace(&mut buf_out, remainder);
+                    let new_chunk = buf_out.drain(..CHUNK_SIZE).collect();
                     if final_chunk && buf_out.is_empty() { new_final_chunk = true }
                     
                     tx_e.send((new_chunk, new_chunk_count, new_final_chunk))?;
@@ -270,14 +257,6 @@ impl Encryption {
     ///   XChaCha20-Poly1305 encryption (including chunk_count/final_chunk sequencing),
     ///   then AES-256-GCM-SIV on the result, and sends `(Vec<u8>, u32)` to `tx_out`.
     ///
-    /// Implementation details:
-    /// - Channels are bounded (`cpu_count * 2`) and cloned for each worker; senders
-    ///   are dropped where appropriate so receiver loops terminate cleanly.
-    /// - `key_cha` and `key_aes` are cloned into each thread.
-    /// - Each spawned thread returns `Result<(), String>`; the function returns a
-    ///   `Vec<thread::JoinHandle<std::result::Result<(), String>>>` so the caller
-    ///   can join and inspect thread results.
-    ///
     /// # Arguments
     /// - `key_cha`: ChaCha key for first-layer encryption.
     /// - `key_aes`: AES key for second-layer encryption.
@@ -308,12 +287,12 @@ impl Encryption {
             e_thread_cnt = cpu_count;
         }
         
-        let (tx_e, rx_e) = bounded(cpu_count + 2);
+        let (tx_e, rx_e) = bounded(cpu_count * 2);
 
         let mut thread_handles = Vec::with_capacity(cpu_count * 2 + 1);
 
         if compress {
-            let (tx_c, rx_c) = bounded(cpu_count + 2);
+            let (tx_c, rx_c) = bounded(cpu_count);
 
             // compression threads
             for _ in 0..c_thread_cnt {
@@ -329,8 +308,6 @@ impl Encryption {
                 }));
             }
 
-            drop(tx_c);
-
             // re-segmentation thread
             {
                 let rx_c = rx_c.clone();
@@ -340,8 +317,6 @@ impl Encryption {
                     Ok(())
                 }));
             }
-
-            drop(tx_e);
         }
 
         // encryption threads
@@ -360,8 +335,6 @@ impl Encryption {
                 Ok(())
             }));
         }
-        
-        drop(tx_out);
 
         thread_handles
     }
@@ -432,6 +405,7 @@ impl Encryption {
 mod tests {
     use super::*;
     use std::fs;
+    use crate::decryption::Decryption;
 
     #[test]
     fn test_hash_password_encrypt() {

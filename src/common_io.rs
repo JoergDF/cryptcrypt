@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
 use secrecy::SecretSlice;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 
-use crate::*;
+use crate::{Result, SPLIT_ENC_FILE_EXT};
 
 /// Struct for file input
 pub struct ReadInput {
@@ -63,8 +63,8 @@ impl ReadInput {
         Ok( Self { f_in, f_in_path, f_in_total_size_remaining, chunk_size, f_in_split, split_index: 0, f_in_read_count: 0 } )
     }
 
-    /// Calculate how much data is left in the input file, how much need to be read for the current chunk 
-    /// and whether it is the final chunk. 
+    /// Calculate how much need to be read for the current chunk, whether it is the final chunk
+    /// and how much data is left in the input file.
     /// 
     /// The remaining bytes of the total file (for splits: sum of all splits) to be read is updated in this method.
     /// 
@@ -206,7 +206,7 @@ impl WriteOutput {
                 }
                 
                 if let Some(split_size) = self.f_out_split.get(self.split_index).copied() {
-                    buf_end = buf_len.min( buf_start + (split_size - self.f_out_write_count) );
+                    buf_end = buf_len.min( buf_start.saturating_add(split_size).saturating_sub(self.f_out_write_count) );
                 } else {
                     // there aren't any more elements in the split list: append all coming bytes to the last (current) file,
                     // hence clear the split list, so this while loop won't be run again
@@ -264,7 +264,7 @@ impl CryptIo {
         let mut chunk_count: u32 = 0; 
         let mut final_chunk = false;
         let (tx_in, rx_in) = bounded(cpu_count * 2);
-        let (tx_out, rx_out) = bounded(cpu_count + 2);
+        let (tx_out, rx_out) = bounded(cpu_count);
 
         // compress (optionally) and encrypt/decrypt in threads
         let crypt_handles = crypt_fn(key_cha, key_aes, compress, rx_in, tx_out, cpu_count);
@@ -272,7 +272,7 @@ impl CryptIo {
         // write output file(s) in a thread
         // chunks have to be ordered first, as durations of parallel threads varies
         let writer_handle = thread::spawn( move || -> std::result::Result<(), String> {  
-            let mut pending_chunks = BTreeMap::new();
+            let mut pending_chunks = HashMap::new();
             let mut write_index = 0;
             for (buf, index) in rx_out {
                 pending_chunks.insert(index, buf);
@@ -324,6 +324,7 @@ impl CryptIo {
 mod tests {
     use super::*;
     use std::fs;
+    use crate::HEADER_SIZE;
 
     #[test]
     fn test_input_sizes() {
