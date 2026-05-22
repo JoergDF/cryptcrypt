@@ -348,7 +348,7 @@ impl Decryption {
         // check format version
         if file_format_version != FILE_FORMAT_VERSION {
             return Err(format!(
-                "This input file format (v{file_format_version}) cannot be decoded with this app version."
+                "This input file format (v{file_format_version}) cannot be decoded with this app version. It requires file format v{FILE_FORMAT_VERSION}."
             ).into());
         }
 
