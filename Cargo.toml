@@ -9,6 +9,7 @@ argon2 = "0.5.3"
 bzip2 = "0.6.1"
 chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.60", features = ["derive"] }
+crossbeam-channel = "0.5.15"
 hkdf = "0.13.0"
 num_cpus = "1.17.0"
 parse-size = "1.1.0"
@@ -17,9 +18,12 @@ rand_chacha = "0.10.0"
 rpassword = "7.4.0"
 secrecy = "0.10.3"
 sha2 = "0.11.0"
-sha3 = "0.11.0"
+sha3 = "0.12.0"
 typenum = "1.19.0"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

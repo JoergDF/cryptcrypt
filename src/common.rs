@@ -1,14 +1,13 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use rpassword::{prompt_password, read_password_from_bufread};
-use std::io::Cursor;
+use rpassword::prompt_password;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
 
-use crate::*;
+use crate::{Result, CHUNK_SIZE, MAX_KEYFILE_CHUNKS, KEY_SIZE};
 
 
 /// Prompts the user to enter a password from the terminal.
@@ -24,13 +23,10 @@ use crate::*;
 /// - `Ok(password)` containing the user's password
 /// - `Err` if passwords don't match (when verify=true) or on I/O error
 fn get_password_from_user(verify: bool) -> Result<SecretString> {
-    if cfg!(test) {
-        println!("!!! Test-password used !!!");
-    }
-
     let password = SecretString::from(
-        if cfg!(test) {
-            read_password_from_bufread(&mut Cursor::new("abc123test\n"))?
+        if cfg!(test) || cfg!(fuzzing) {
+            if !cfg!(fuzzing) { println!("!!! Test-password used !!!"); }
+            "abc123test".to_string()
         } else {
             prompt_password("Enter password: ")?
         }
@@ -38,8 +34,8 @@ fn get_password_from_user(verify: bool) -> Result<SecretString> {
 
     if verify {
         let password_rep = SecretString::from( 
-            if cfg!(test) {
-                read_password_from_bufread(&mut Cursor::new("abc123test\n"))?
+            if cfg!(test) || cfg!(fuzzing) {
+                "abc123test".to_string()
             } else {
                 prompt_password("Repeat password: ")? 
             }
@@ -145,6 +141,7 @@ mod tests {
     use super::*;
     use std::fs;
     use rand::Rng;
+    use crate::SALT_SIZE;
 
     #[test]
     fn test_get_password_from_user() {
@@ -259,128 +256,5 @@ mod tests {
         let okm6 = key_derivation(&key_sec, &salt6, &info).unwrap();
         assert_ne!(okm6.expose_secret(), [0u8; KEY_SIZE]);
         assert_ne!(okm1.expose_secret(), okm6.expose_secret());
-    }
-
-    #[test]
-    fn test_chacha_crypt_buffer() {
-        let key: [u8; 32]  = rand::random();
-        let key = SecretSlice::from(key.to_vec());
-        let data: [u8; 100] = rand::random();
-
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
-        assert_eq!(encrypt_data.len(), data.len() + CHA_NONCE_SIZE + CHA_TAG_SIZE);
-        assert_eq!(data, decrypt_data[..]);
-
-        // second encryption must produce different output of the same input
-        let encrypt_data2 = Encryption::cha_encrypt_buffer(&key, &data, 0, false).unwrap();
-        // nonce part must be different
-        assert_ne!(encrypt_data[..CHA_NONCE_SIZE], encrypt_data2[..CHA_NONCE_SIZE]);
-        // encrypted data part must be different
-        assert_ne!(encrypt_data[CHA_NONCE_SIZE..], encrypt_data2[CHA_NONCE_SIZE..]);
-
-        // corrupt nonce
-        let mut bad_data = encrypt_data.clone();
-        bad_data[0] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&key, &bad_data, 0, false).is_err());
-
-        // corrupt data
-        let mut bad_data = encrypt_data.clone();
-        bad_data[CHA_NONCE_SIZE+1] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&key, &bad_data, 0, false).is_err());
-
-        // wrong key
-        let mut bad_key = key.clone();
-        bad_key.expose_secret_mut()[0] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&bad_key, &encrypt_data, 0, false).is_err());
-
-        // wrong final chunk flag
-        assert!(Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, true).is_err());
-
-        // wrong chunk count
-        assert!(Decryption::cha_decrypt_buffer(&key, &encrypt_data, 1, false).is_err());
-
-        // different values for chunk count and final chunk flag
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0, true).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, true).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 42, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 42, false).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0x1000_0000, true).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0x1000_0000, true).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0xFFFF_FFFF, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0xFFFF_FFFF, false).unwrap();
-        assert_eq!(data, decrypt_data[..]);
-
-        // empty input data
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &[], 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
-        assert_eq!(encrypt_data.len(), CHA_NONCE_SIZE + CHA_TAG_SIZE);
-        assert_eq!(decrypt_data.len(), 0);
-
-        // large input data
-        let data_big = vec![0u8; CHUNK_SIZE * 2 + 123];
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data_big, 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
-        assert_eq!(data_big, decrypt_data[..]);
-    }
-
-    #[test]
-    fn test_aes_crypt_buffer() {
-        let key: [u8; 32]  = rand::random();
-        let key = SecretSlice::from(key.to_vec());
-        let data: [u8; 100] = rand::random();
-
-        let encrypt_data = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
-        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data[3..]).unwrap();
-        assert_eq!(encrypt_data.len(), data.len() + AES_LENGTH_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE);
-        assert_eq!(data, decrypt_data[..]);
-
-        // second encryption must produce different output of the same input
-        let encrypt_data2 = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
-        // nonce part must be different
-        assert_ne!(encrypt_data[AES_LENGTH_SIZE..AES_LENGTH_SIZE + AES_NONCE_SIZE], encrypt_data2[AES_LENGTH_SIZE..AES_LENGTH_SIZE + AES_NONCE_SIZE]);
-        // encrypted data part must be different
-        assert_ne!(encrypt_data[3 + AES_NONCE_SIZE..], encrypt_data2[3 + AES_NONCE_SIZE..]);
-
-        // corrupt 'nonce'
-        let mut bad_data = encrypt_data.clone();
-        bad_data[AES_LENGTH_SIZE+1] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
-
-        // corrupt 'data'
-        let mut bad_data = encrypt_data.clone();
-        bad_data[AES_LENGTH_SIZE + AES_NONCE_SIZE + 1] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
-
-        // wrong key
-        let mut bad_key = key.clone();
-        bad_key.expose_secret_mut()[0] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&bad_key, &encrypt_data).is_err());
-    }
-
-    #[test]
-    fn test_de_compress_buffer() {
-        let dat_in = "Hello test".repeat(10);
-
-        // compress
-        let out_z = Encryption::compress_buffer(dat_in.as_bytes()).unwrap();
-        assert!(out_z.len() < dat_in.len());
-        assert!(!out_z.is_empty());
-
-        //decompress
-        let dat_out = Decryption::decompress_buffer(&out_z).unwrap();
-        assert_eq!(dat_in.as_bytes(), dat_out);
-
-        // empty input
-        let out_z = Encryption::compress_buffer(&[]).unwrap();
-        assert!(!out_z.is_empty());
-        let dat_out = Decryption::decompress_buffer(&out_z).unwrap();
-        assert!(dat_out.is_empty());
     }
 }

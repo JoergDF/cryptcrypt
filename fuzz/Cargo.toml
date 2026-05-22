@@ -1,0 +1,37 @@
+[package]
+name = "cryptcrypt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cryptcrypt = { path = ".." }
+arbitrary = { version = "1", features = ["derive"] }
+glob = "0.3.3"
+rand = "0.10.1"
+secrecy = "0.10.3"
+
+[[bin]]
+name = "fuzzer_encdec"
+path = "fuzz_targets/fuzzer_encdec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzzer_split"
+path = "fuzz_targets/fuzzer_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzzer_chunk_encdec"
+path = "fuzz_targets/fuzzer_chunk_encdec.rs"
+test = false
+doc = false
+bench = false

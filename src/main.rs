@@ -1,39 +1,10 @@
-use std::error::Error;
 use std::path::PathBuf;
 use clap::Parser;
 use std::process::ExitCode;
-use typenum::Unsigned;
-use aes_gcm_siv::{Aes256GcmSiv, AeadCore};
-use chacha20poly1305::{XChaCha20Poly1305};
 use parse_size::Config;
-use crate::encryption::Encryption;
-use crate::decryption::Decryption;
-
-
-mod common;
-mod common_io;
-mod encryption;
-mod decryption;
-
-
-const FILE_FORMAT_VERSION: u8   = 3;
-const ENCRYPTED_FILE_EXT: &str  = "cce";
-const SPLIT_ENC_FILE_EXT: &str  = "c00";
-const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
-const MAX_KEYFILE_CHUNKS: usize = 64;
-const SALT_SIZE: usize          = 32; 
-const KEY_SIZE: usize           = 32;
-const AES_LENGTH_SIZE: usize    = 3;
-const HEADER_SIZE: usize        = 2 + 3 * SALT_SIZE;
-const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USIZE;      // 12 bytes
-const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
-#[cfg(test)]
-const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;        // 16 bytes
-#[cfg(test)]
-const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;   // 16 bytes
-
-
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+use cryptcrypt::encryption::Encryption;
+use cryptcrypt::decryption::Decryption;
+use cryptcrypt::Result;
 
 
 #[derive(Parser)]
@@ -66,25 +37,11 @@ struct Args {
 
 /// Main entry point for the cryptcrypt application.
 ///
-/// Parses command-line arguments and dispatches to either encryption or decryption
-/// based on the provided flags.
-///
 /// # Returns
 /// - `ExitCode::SUCCESS` on successful completion
-/// - `ExitCode::FAILURE` if an error occurs during encryption/decryption
-/// 
+/// - `ExitCode::FAILURE` if an error occurs 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    
-    let filepath = args.file;
-    let keyfilepath = args.keyfile;
-
-    let result = 
-        if args.decrypt {
-            Decryption::decrypt(&filepath, keyfilepath.as_ref())
-        } else {
-            Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)
-        };
+    let result = run();
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -93,4 +50,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Run the code.
+/// 
+/// Parses command-line arguments and dispatches to either encryption or decryption
+/// based on the provided flags.
+fn run() -> Result<()> {
+    let args = Args::parse();
+ 
+    let filepath = args.file.canonicalize()?;
+    let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
+
+    if args.decrypt {
+        Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
+    } else {
+        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?;
+    }
+
+    Ok(())
 }

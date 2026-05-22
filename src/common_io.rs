@@ -1,10 +1,13 @@
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::thread;
+use crossbeam_channel::{bounded, Sender, Receiver};
 use secrecy::SecretSlice;
+use std::collections::HashMap;
 
-use crate::*;
+
+use crate::{Result, SPLIT_ENC_FILE_EXT};
 
 /// Struct for file input
 pub struct ReadInput {
@@ -20,6 +23,8 @@ pub struct ReadInput {
     f_in_split: Vec<u64>,    
     /// Index into split list
     split_index: usize,
+    /// Number of read bytes of current file (required for series of split files)
+    f_in_read_count: u64,
 }
 
 impl ReadInput {
@@ -27,8 +32,8 @@ impl ReadInput {
     /// 
     /// # Arguments
     /// - `f_in_path`: File input path
-    /// - `chunk_size`: chunk size, if 0, read chunk size from chunk header
-    /// - `f_in_header_size`: Header size of file input, required for calculating remaining file size
+    /// - `chunk_size`: Chunk size in bytes
+    /// - `f_in_header_size`: Header size of file to be decrypted, required for calculating remaining file size
     /// 
     /// # Returns
     /// - `Ok(Self)` on success
@@ -36,65 +41,48 @@ impl ReadInput {
     pub fn new(f_in_path: PathBuf, chunk_size: usize, f_in_header_size: usize) -> Result<Self> {
         let f_in = File::open(&f_in_path)?;
 
-        let mut f_in_size = 0;
+        let mut f_in_total_size = 0;
         let mut f_in_split = vec![];
         // for decryption (f_in_header_size != 0) and splitted files:
         // get sum of file sizes and fill split list with file sizes
         if f_in_header_size != 0 && f_in_path.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
             let mut split_idx = 0;
-            let mut f_path = f_in_path.clone();
-            
-            while let Ok(meta) = std::fs::metadata(&f_path) {
+            while let Ok(meta) = f_in_path.with_extension(format!("c{:02}", split_idx)).metadata() {
                 let file_size = meta.len();
-                f_in_size += file_size;
+                f_in_total_size += file_size;
                 f_in_split.push(file_size);
                 split_idx += 1;
-                f_path.set_extension(format!("c{:02}", split_idx));
             }
         } else {
-            f_in_size = f_in.metadata()?.len();
+            f_in_total_size = f_in.metadata()?.len();
         }
         
         // header was already read, therefore remaining file size must be reduced by the header's size
-        let f_in_size_remaining = f_in_size - u64::try_from(f_in_header_size)?;
+        let f_in_total_size_remaining = f_in_total_size - u64::try_from(f_in_header_size)?;
 
-        Ok( Self { f_in, f_in_path, f_in_total_size_remaining: f_in_size_remaining, chunk_size, f_in_split, split_index: 0 } )
+        Ok( Self { f_in, f_in_path, f_in_total_size_remaining, chunk_size, f_in_split, split_index: 0, f_in_read_count: 0 } )
     }
 
-    /// Calculate how much data is left in the input file, how much need to be read for the current chunk 
-    /// and whether it is the final chunk. 
+    /// Calculate how much need to be read for the current chunk, whether it is the final chunk
+    /// and how much data is left in the input file.
     /// 
-    /// The remaining bytes to be read is updated in this method (`self.f_in_size_remaining`).
-    /// If compression is used, the chunk size varies. The size is coded in the 3 bytes 
-    /// at the start of a chunk in little endian order.
+    /// The remaining bytes of the total file (for splits: sum of all splits) to be read is updated in this method.
     /// 
     /// # Returns
     /// - `Ok((read_size, final_chunk))` chunk size to be read and if it is the final chunk
     /// - `Err` if file I/O or variable conversion fails 
     fn input_sizes(&mut self) -> Result<(usize, bool)> {
-        let cuk_size = if self.chunk_size == 0 {
-            // dynamic chunk size
-            let mut buf = [0u8; AES_LENGTH_SIZE];
-            self.read_files(&mut buf)?;
-            self.f_in_total_size_remaining -= u64::try_from(buf.len())?;
-            let c_size: [u8; 4] = [&buf[..], &[0]].concat().try_into().unwrap();
-            u32::from_le_bytes(c_size)
-        } else {
-            // static chunk size
-            u32::try_from(self.chunk_size)?
-        };
-
         let (read_size, final_chunk) = 
-            if self.f_in_total_size_remaining <= u64::from(cuk_size) {
+            if self.f_in_total_size_remaining <= u64::try_from(self.chunk_size)? {
                 // final chunk
-                (u32::try_from(self.f_in_total_size_remaining)?, true)
+                (usize::try_from(self.f_in_total_size_remaining)?, true)
             } else {
-                (cuk_size, false)
+                (self.chunk_size, false)
             };
 
-        self.f_in_total_size_remaining -= u64::from(read_size);
+        self.f_in_total_size_remaining -= u64::try_from(read_size)?;
 
-        Ok((read_size as usize, final_chunk))
+        Ok((read_size, final_chunk))
     }
 
     /// Read bytes into provided buffer from the configured input file(s).
@@ -112,34 +100,31 @@ impl ReadInput {
         if self.f_in_split.is_empty() {
             self.f_in.read_exact(&mut buf[..])?;
         } else {
-            let mut file_remaining = self.f_in_split[self.split_index] - self.f_in.stream_position()?; 
+            // split input file 
+            let mut file_size = self.f_in_split[self.split_index] - self.f_in_read_count;
             let buf_len = u64::try_from(buf.len())?;
-            let mut buf_start: u64 = 0;
-            let mut buf_end: u64   = 0;
+            let mut buf_end: u64 = 0;
 
             while buf_end < buf_len {
-                if buf_end - buf_start == file_remaining {
+                if self.f_in_read_count == self.f_in_split[self.split_index] {
                     self.split_index += 1;
-                    let f_in_name = &mut self.f_in_path;
-                    f_in_name.set_extension(format!("c{:02}", self.split_index));
-                    if let Ok(f_in) = File::open(&f_in_name) {
-                        self.f_in = f_in;
-                        file_remaining = self.f_in_split[self.split_index];
-                    } else {
-                        // no more files
-                        break;
-                    }
+                    let next_f_in_path = self.f_in_path.with_extension(format!("c{:02}", self.split_index));
+                    self.f_in = File::open(&next_f_in_path)?;
+                    file_size = self.f_in_split[self.split_index];
+                    self.f_in_read_count = 0;
                 }
 
-                buf_start = buf_end;
-                if (buf_len - buf_start) <= file_remaining {
+                let buf_start = buf_end;
+                if (buf_len - buf_start) <= file_size {
                     buf_end = buf_len;
                 } else { 
-                    buf_end = buf_start + file_remaining;
+                    buf_end = buf_start + file_size;
                 }
 
                 let (s, e) = (usize::try_from(buf_start)?, usize::try_from(buf_end)?);
                 self.f_in.read_exact(&mut buf[s..e])?;
+
+                self.f_in_read_count += buf_end - buf_start;
             }
         } 
 
@@ -171,7 +156,7 @@ pub struct WriteOutput {
     f_out_split: Vec<u64>,
     /// Index into split list
     split_index: usize,
-    /// Count written bytes during split operation
+    /// Number of written bytes of current file (required for split operation)
     f_out_write_count: u64,
 }
 
@@ -208,7 +193,7 @@ impl WriteOutput {
             let buf_len = u64::try_from(buf.len())?;
 
             while buf_end < buf_len { 
-                if self.f_out_split[self.split_index] == self.f_out_write_count {
+                if self.f_out_write_count == self.f_out_split[self.split_index] {
                     // next split
                     self.split_index += 1;
                     buf_start = buf_end;
@@ -220,11 +205,11 @@ impl WriteOutput {
                     self.f_out_write_count = 0;    
                 }
                 
-                // if there aren't any more elements in the split list, then append all coming bytes to the last (current) file,
-                // hence clear the split list, so this while loop won't be run again
-                if let Some(split_chunk) = self.f_out_split.get(self.split_index).copied() {
-                    buf_end = buf_len.min( buf_start + (split_chunk - self.f_out_write_count) );
+                if let Some(split_size) = self.f_out_split.get(self.split_index).copied() {
+                    buf_end = buf_len.min( buf_start.saturating_add(split_size).saturating_sub(self.f_out_write_count) );
                 } else {
+                    // there aren't any more elements in the split list: append all coming bytes to the last (current) file,
+                    // hence clear the split list, so this while loop won't be run again
                     buf_end = buf_len;
                     self.f_out_split.clear();
                 }
@@ -242,22 +227,12 @@ impl WriteOutput {
 
 
 /// Struct for common cryptographic I/O operations
-pub struct CryptIo {
-    /// Read chunks from file(s)
-    read_input: ReadInput,
-    /// Write chunks to file(s)
-    write_output: WriteOutput,
-}
+pub struct CryptIo;
 
 impl CryptIo {
-    /// Initializes struct
-    pub fn new(read_input: ReadInput, write_output: WriteOutput) -> Self {
-        Self { read_input, write_output }
-    }
-
-    /// Performs cryptographic I/O operations on a file using chunked processing with multithreading.
+    /// Performs cryptographic I/O operations and optional compression on a file using chunked processing with multithreading.
     ///
-    /// Reads input file in chunks, applies two sequential cryptographic functions to each chunk
+    /// Reads input file in chunks, applies optional compression and two sequential cryptographic functions to each chunk
     /// using parallelism by threads and writes the results.
     ///
     /// # Arguments
@@ -268,47 +243,74 @@ impl CryptIo {
     ///
     /// # Returns
     /// - `Ok(())` on successful completion
-    /// - `Err` if file I/O fails or cryptographic functions fail
+    /// - `Err` if file I/O fails, channels fail or cryptographic functions fail   
     #[allow(clippy::type_complexity)]
     pub fn io_chunks(
-        &mut self,
         key_cha: &SecretSlice<u8>, 
         key_aes: &SecretSlice<u8>,
         compress: bool,
-        crypt_fn: fn(&SecretSlice<u8>, &SecretSlice<u8>, &[u8], u32, bool, bool) -> Result<Vec<u8>>
+        crypt_fn: fn(
+            &SecretSlice<u8>, 
+            &SecretSlice<u8>,
+            bool,
+            Receiver<(Vec<u8>, u32, bool)>, 
+            Sender<(Vec<u8>, u32)>,
+            usize) -> Vec<thread::JoinHandle<std::result::Result<(), String>>>,
+        mut read_input: ReadInput,
+        mut write_output: WriteOutput,
     ) -> Result<()> {
+
         let cpu_count = num_cpus::get();
         let mut chunk_count: u32 = 0; 
         let mut final_chunk = false;
+        let (tx_in, rx_in) = bounded(cpu_count * 2);
+        let (tx_out, rx_out) = bounded(cpu_count);
 
-        while !final_chunk {
-            let mut child_threads = Vec::with_capacity(cpu_count);
+        // compress (optionally) and encrypt/decrypt in threads
+        let crypt_handles = crypt_fn(key_cha, key_aes, compress, rx_in, tx_out, cpu_count);
 
-            for _ in 0..cpu_count {
-                let key_cha = key_cha.clone();
-                let key_aes = key_aes.clone();
-
-                let buf_in;
-                (buf_in, final_chunk) = self.read_input.read_chunk()?;
-
-                child_threads.push(thread::spawn(move || {
-                        let buf_out = crypt_fn(&key_cha, &key_aes, &buf_in, chunk_count, final_chunk, compress)
-                            .map_err(|e| e.to_string())?;
-                        Ok::<Vec<u8>, String>(buf_out)
-                    }));
-                
-                if final_chunk {
-                    break;
-                } 
-                chunk_count += 1;
+        // write output file(s) in a thread
+        // chunks have to be ordered first, as durations of parallel threads varies
+        let writer_handle = thread::spawn( move || -> std::result::Result<(), String> {  
+            let mut pending_chunks = HashMap::new();
+            let mut write_index = 0;
+            for (buf, index) in rx_out {
+                pending_chunks.insert(index, buf);
+                while let Some(buf_out) = pending_chunks.remove(&write_index) {
+                    write_output.write_files(&buf_out).map_err(|e| e.to_string())?;
+                    write_index += 1;
+                }
             }
+            Ok(())
+        });
 
-            for child in child_threads {
-                let buf_out = child.join().unwrap()?;
-                self.write_output.write_files(&buf_out)?;
+        // read input file(s)
+        while !final_chunk {    
+            let buf_in;
+            (buf_in, final_chunk) = read_input.read_chunk()?;
+            // don't throw error on send, otherwise errors in encryption/decryption aren't shown to user
+            if tx_in.send((buf_in, chunk_count, final_chunk)).is_err() { break }
+            chunk_count += 1;
+        }
+
+        drop(tx_in);
+
+        // join and error handling of encryption/decryption threads
+        for ch in crypt_handles {
+            match ch.join() {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => return Err(e.into()),
+                Err(panic) => return Err(format!("Crypt thread panicked: {:?}", panic).into()),
             }
         }
-        
+
+        // join and error handling of file writer thread
+        match writer_handle.join() {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => return Err(e.into()),
+            Err(panic) => return Err(format!("Writer thread panicked: {:?}", panic).into()),
+        }
+
         Ok(())
     }
 }
@@ -322,16 +324,16 @@ impl CryptIo {
 mod tests {
     use super::*;
     use std::fs;
+    use crate::HEADER_SIZE;
 
     #[test]
     fn test_input_sizes() {
         let test_file = "test_input_sizes.bin";
         
-        // --- Static chunk size ---
         let data = vec![0u8; 100];
         fs::write(test_file, &data).unwrap();
         
-        // Case 1: Static chunk, not final
+        // Case 1: chunk not final
         // File size 100, header 10 -> remaining 90. Chunk 50.
         let mut ri = ReadInput::new(PathBuf::from(test_file), 50, 10).unwrap();
         let (read_size, final_chunk) = ri.input_sizes().unwrap();
@@ -339,43 +341,10 @@ mod tests {
         assert!(!final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 40);
 
-        // Case 2: Static chunk, final
+        // Case 2: chunk final
         // Continuing from above: remaining 40. Chunk 50.
         let (read_size, final_chunk) = ri.input_sizes().unwrap();
         assert_eq!(read_size, 40);
-        assert!(final_chunk);
-        assert_eq!(ri.f_in_total_size_remaining, 0);
-        
-        // --- Dynamic chunk size ---
-        // Case 3: Dynamic chunk, not final
-        // File content: [0x10, 0x00, 0x00, ... 100 bytes total]
-        // Header size 0 -> remaining 100.
-        let mut data = vec![0u8; 100];
-        data[0] = 0x10; // cuk_size = 16
-        fs::write(test_file, &data).unwrap();
-
-        let mut ri = ReadInput::new(PathBuf::from(test_file), 0, 0).unwrap();
-        let (read_size, final_chunk) = ri.input_sizes().unwrap();
-        // Reads 3 bytes (header). remaining: 100 - 3 = 97.
-        // cuk_size is 16. 97 > 16, so not final.
-        // read_size = 16. remaining: 97 - 16 = 81.
-        assert_eq!(read_size, 16);
-        assert!(!final_chunk);
-        assert_eq!(ri.f_in_total_size_remaining, 81);
-
-        // Case 4: Dynamic chunk, final
-        // File content: [0x50, 0x00, 0x00, ... 10 bytes total]
-        // Header size 0 -> remaining 10.
-        let mut data = vec![0u8; 10];
-        data[0] = 0x50; // cuk_size = 80
-        fs::write(test_file, &data).unwrap();
-
-        let mut ri = ReadInput::new(PathBuf::from(test_file), 0, 0).unwrap();
-        let (read_size, final_chunk) = ri.input_sizes().unwrap();
-        // Reads 3 bytes. remaining: 10 - 3 = 7.
-        // cuk_size is 80. 7 <= 80, so final.
-        // read_size = 7. remaining: 7 - 7 = 0.
-        assert_eq!(read_size, 7);
         assert!(final_chunk);
         assert_eq!(ri.f_in_total_size_remaining, 0);
 
@@ -490,7 +459,6 @@ mod tests {
     fn test_read_chunk() {
         let test_file = "test_read_chunk.bin";
 
-        // --- Static chunk size ---
         let data = vec![1u8; 100];
         fs::write(test_file, &data).unwrap();
 
@@ -518,28 +486,6 @@ mod tests {
         let (buf, final_chunk) = ri.read_chunk().unwrap();
         assert_eq!(buf.len(), 10);
         assert_eq!(buf, vec![1u8; 10]);
-        assert!(final_chunk);
-
-        // --- Dynamic chunk size ---
-        // Each chunk starts with 3 bytes (LE) length.
-        // Chunk 1: 5 bytes data. Header: [0x05, 0x00, 0x00]. Total 8 bytes.
-        // Chunk 2: 2 bytes data. Header: [0x02, 0x00, 0x00]. Total 5 bytes.
-        let mut dynamic_data = vec![0x05, 0x00, 0x00];
-        dynamic_data.extend_from_slice(&[2u8; 5]);
-        dynamic_data.extend_from_slice(&[0x02, 0x00, 0x00]);
-        dynamic_data.extend_from_slice(&[3u8; 2]);
-        fs::write(test_file, &dynamic_data).unwrap();
-
-        let mut ri = ReadInput::new(PathBuf::from(test_file), 0, 0).unwrap();
-
-        let (buf, final_chunk) = ri.read_chunk().unwrap();
-        assert_eq!(buf.len(), 5);
-        assert_eq!(buf, vec![2u8; 5]);
-        assert!(!final_chunk);
-
-        let (buf, final_chunk) = ri.read_chunk().unwrap();
-        assert_eq!(buf.len(), 2);
-        assert_eq!(buf, vec![3u8; 2]);
         assert!(final_chunk);
 
         // cleanup
