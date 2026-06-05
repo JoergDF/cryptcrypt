@@ -9,8 +9,8 @@ use cryptcrypt::Result;
 
 #[derive(Parser)]
 #[command(version, about, verbatim_doc_comment, long_about = None)]
-/// Program for encryption and decryption of a file.
-/// If no option is given, file is encrypted. 
+/// Program for encryption and decryption of file or directory.
+/// If no option is given, input is encrypted. A directory as input causes the build of an encrypted archive.
 /// With option -s the encrypted output is split into files with extensions .c00, .c01, .c02, ...
 /// If a file ending on .c00 is decrypted, the whole split series will be read.
 struct Args {
@@ -31,8 +31,9 @@ struct Args {
       value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
     split: Vec<u64>,
 
-    /// File that should be encrypted or decrypted
-    file: PathBuf,
+    /// File that should be encrypted or decrypted. 
+    /// If a directory is given, all its files and sub-directories are concatenated and encrypted.
+    file_or_dir: PathBuf,
 }
 
 /// Main entry point for the cryptcrypt application.
@@ -46,7 +47,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Error: {}", e);
             ExitCode::FAILURE
         }
     }
@@ -58,8 +59,14 @@ fn main() -> ExitCode {
 /// based on the provided flags.
 fn run() -> Result<()> {
     let args = Args::parse();
- 
-    let filepath = args.file.canonicalize()?;
+
+    let filepath = if args.file_or_dir.is_dir() {
+        // a directory should be used as is (relative or absolute), therefore do not canonicalize, which results in an absolute path
+        args.file_or_dir 
+    } else {
+        args.file_or_dir.canonicalize()?
+    };
+
     let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
 
     if args.decrypt {

@@ -7,7 +7,16 @@ use secrecy::SecretSlice;
 use std::collections::HashMap;
 
 
-use crate::{Result, SPLIT_ENC_FILE_EXT};
+use crate::{AES_NONCE_SIZE, AES_TAG_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, Result, SPLIT_ENC_FILE_EXT};
+
+
+pub trait ReadChunk {
+    fn read_chunk(&mut self) -> Result<(Vec<u8>, bool)>;
+}
+
+pub trait WriteFiles {
+    fn write_files(&mut self, buf_in: &[u8]) -> Result<()>;
+}
 
 /// Struct for file input
 pub struct ReadInput {
@@ -38,7 +47,7 @@ impl ReadInput {
     /// # Returns
     /// - `Ok(Self)` on success
     /// - `Err(...)` when an I/O or conversion error occurs
-    pub fn new(f_in_path: PathBuf, chunk_size: usize, f_in_header_size: usize) -> Result<Self> {
+    pub fn new(f_in_path: PathBuf, chunk_size: usize, f_in_header_size: u64) -> Result<Self> {
         let f_in = File::open(&f_in_path)?;
 
         let mut f_in_total_size = 0;
@@ -57,8 +66,13 @@ impl ReadInput {
             f_in_total_size = f_in.metadata()?.len();
         }
         
+        if f_in_header_size != 0 
+        && f_in_total_size < f_in_header_size + (CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE) as u64 {
+            return Err("File cannot be decoded".into());
+        }
+
         // header was already read, therefore remaining file size must be reduced by the header's size
-        let f_in_total_size_remaining = f_in_total_size - u64::try_from(f_in_header_size)?;
+        let f_in_total_size_remaining = f_in_total_size - f_in_header_size;
 
         Ok( Self { f_in, f_in_path, f_in_total_size_remaining, chunk_size, f_in_split, split_index: 0, f_in_read_count: 0 } )
     }
@@ -130,13 +144,15 @@ impl ReadInput {
 
         Ok(())
     }
+}
 
+impl ReadChunk for ReadInput {
     /// Read a single chunk from the logical file(s) and indicate whether it is the final chunk.
     ///
     /// # Returns 
     /// - `Ok((buf_in, final_chunk))` contains the read chunk buffer and if it is the final chunk
     /// - `Err(...)` when an I/O or conversion error occurs
-    pub fn read_chunk(&mut self) -> Result<(Vec<u8>, bool)> {
+    fn read_chunk(&mut self) -> Result<(Vec<u8>, bool)> {
         let (read_size, final_chunk) = self.input_sizes()?;
         let mut buf_in = vec![0u8; read_size];
         self.read_files(&mut buf_in)?;
@@ -174,7 +190,9 @@ impl WriteOutput {
         let f_out = File::create(&f_out_path)?;
         Ok( Self { f_out, f_out_path, f_out_split, split_index: 0, f_out_write_count: 0 } )
     }
+}
 
+impl WriteFiles for WriteOutput {
     /// Writes the provided buffer across one or more output files according to the configured splits.
     ///
     /// - If `self.f_out_split` is empty: append the entire buffer to the current output file.
@@ -184,7 +202,7 @@ impl WriteOutput {
     /// # Returns
     /// - `Ok(())` on success
     /// - `Err(...)` when an I/O or conversion error occurs
-    pub fn write_files(&mut self, buf: &[u8]) -> Result<()> {
+    fn write_files(&mut self, buf: &[u8]) -> Result<()> {
         if self.f_out_split.is_empty() {
             self.f_out.write_all(buf)?;
         } else {
@@ -256,8 +274,8 @@ impl CryptIo {
             Receiver<(Vec<u8>, u32, bool)>, 
             Sender<(Vec<u8>, u32)>,
             usize) -> Vec<thread::JoinHandle<std::result::Result<(), String>>>,
-        mut read_input: ReadInput,
-        mut write_output: WriteOutput,
+        read_input: &mut (impl ReadChunk + ?Sized),
+        mut write_output: Box<dyn WriteFiles + Send + 'static>,
     ) -> Result<()> {
 
         let cpu_count = num_cpus::get();
@@ -364,20 +382,20 @@ mod tests {
         // only first split
         let mut buf = [0u8; 1000];
         let f_in_path = PathBuf::from("test_split_in.c00");
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE).unwrap();
+        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf).unwrap();
         assert_eq!(buf, data0);
 
         // all splits
         let mut buf = [0u8; 3028];
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE).unwrap();
+        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf).unwrap();
         assert_eq!(buf[..], [&data0[..], &data1[..], &data2[..]].concat());
 
         // 2 reads
         let mut buf0 = [0u8; 4];
         let mut buf1 = [0u8; 2000];
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE).unwrap();
+        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf0).unwrap();
         assert_eq!(buf0[..], data0[..4]);
         ri.read_files(&mut buf1).unwrap();

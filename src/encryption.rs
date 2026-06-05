@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use crate::{Result, SALT_SIZE, KEY_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, AES_NONCE_SIZE, AES_TAG_SIZE, CHUNK_SIZE, 
             COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT, SPLIT_ENC_FILE_EXT, HEADER_SIZE, FILE_FORMAT_VERSION};
 use crate::common::{get_pass_bytes, key_derivation};
-use crate::common_io::{CryptIo, ReadInput, WriteOutput};
-
+use crate::common_io::{CryptIo, ReadInput, WriteOutput, ReadChunk, WriteFiles};
+use crate::archive::ArchiveRead;
 
 /// Handles file encryption operations using dual-layer encryption and compression.
 ///
@@ -363,6 +363,14 @@ impl Encryption {
             filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
         }
 
+        let build_archive = filepath_in.is_dir();
+
+        let mut read_input: Box<dyn ReadChunk> = if build_archive {
+            Box::new( ArchiveRead::new(filepath_in.to_path_buf()) )
+        } else {
+            Box::new( ReadInput::new(filepath_in.to_path_buf(), CHUNK_SIZE, 0)? )
+        };
+
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
 
@@ -371,26 +379,24 @@ impl Encryption {
         //      0  version of file format
         //      1  info about file format
         //           bit 0: compression on(1)/off(0)
+        //           bit 1: archive
         //  2..33  32-byte-salt of password hash
         // 34..65  32-byte-salt of cha key derivation
         // 66..97  32-byte-salt of aes key derivation
         let mut header = Vec::with_capacity(HEADER_SIZE);
         header.push(FILE_FORMAT_VERSION);
-        header.push(u8::from(compress));
+        header.push(u8::from(compress) | (u8::from(build_archive) << 1));
         header.extend(salt_pw);
         header.extend(salt_cha);
         header.extend(salt_aes);
 
-        // set read parameters and open input file
-        let read_input = ReadInput::new(filepath_in.to_path_buf(), CHUNK_SIZE, 0)?;
-
          // set write parameters and create output file
-        let mut write_output = WriteOutput::new(filepath_out, split)?;
+        let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
 
         // write header
         write_output.write_files(&header)?;
 
-        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
+        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input.as_mut(), write_output)?;
 
         Ok(())
     }
@@ -734,7 +740,9 @@ mod tests {
 
         // input file does not exist
         assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None, false, vec![]).is_err());
-        assert!(Decryption::decrypt(&PathBuf::from("test_miss"), None).is_err());
+        assert!(Decryption::decrypt(&PathBuf::from("test_miss.cce"), None).is_err());
+        assert!(!fs::exists("test_miss").unwrap());
+        assert!(!fs::exists("test_miss.cce").unwrap());
 
         // with compression
         fs::write(&filepath_in, &data).unwrap();

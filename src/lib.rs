@@ -8,6 +8,7 @@ pub mod common;
 pub mod common_io;
 pub mod encryption;
 pub mod decryption;
+pub mod archive;
 
 
 pub const FILE_FORMAT_VERSION: u8   = 4;
