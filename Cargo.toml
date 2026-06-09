@@ -19,6 +19,7 @@ rpassword = "7.4.0"
 secrecy = "0.10.3"
 sha2 = "0.11.0"
 sha3 = "0.12.0"
+typed-path = "0.12.3"
 typenum = "1.19.0"
 walkdir = "2.5.0"
 

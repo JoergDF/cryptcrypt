@@ -366,7 +366,7 @@ impl Encryption {
         let build_archive = filepath_in.is_dir();
 
         let mut read_input: Box<dyn ReadChunk> = if build_archive {
-            Box::new( ArchiveRead::new(filepath_in.to_path_buf()) )
+            Box::new( ArchiveRead::new(filepath_in) )
         } else {
             Box::new( ReadInput::new(filepath_in.to_path_buf(), CHUNK_SIZE, 0)? )
         };
