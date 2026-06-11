@@ -313,6 +313,13 @@ impl CryptIo {
 
         drop(tx_in);
 
+        // join and error handling of file writer thread
+        match writer_handle.join() {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => return Err(e.into()),
+            Err(panic) => return Err(format!("Writer thread panicked: {:?}", panic).into()),
+        }
+
         // join and error handling of encryption/decryption threads
         for ch in crypt_handles {
             match ch.join() {
@@ -320,13 +327,6 @@ impl CryptIo {
                 Ok(Err(e)) => return Err(e.into()),
                 Err(panic) => return Err(format!("Crypt thread panicked: {:?}", panic).into()),
             }
-        }
-
-        // join and error handling of file writer thread
-        match writer_handle.join() {
-            Ok(Ok(())) => {},
-            Ok(Err(e)) => return Err(e.into()),
-            Err(panic) => return Err(format!("Writer thread panicked: {:?}", panic).into()),
         }
 
         Ok(())

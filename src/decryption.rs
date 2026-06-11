@@ -266,7 +266,7 @@ impl Decryption {
                 for (buf_in, chunk_count, final_chunk) in rx_in {
                     let buf_aes = Self::aes_decrypt_buffer(&key_aes, &buf_in).map_err(|e| e.to_string())?;
                     let buf_cha = Self::cha_decrypt_buffer(&key_cha, &buf_aes, chunk_count, final_chunk).map_err(|e| e.to_string())?;
-                    tx_e.send((buf_cha, chunk_count)).map_err(|e| e.to_string())?;
+                    if tx_e.send((buf_cha, chunk_count)).is_err() { break }
                 }
                 Ok(())
             }));
@@ -293,7 +293,7 @@ impl Decryption {
                 thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> {
                     for (buf_in, chunk_count) in rx_c {
                         let buf_zip = Self::decompress_buffer(&buf_in).map_err(|e| e.to_string())?;
-                        tx_out.send((buf_zip, chunk_count)).map_err(|e| e.to_string())?;
+                        if tx_out.send((buf_zip, chunk_count)).is_err() { break }
                     }
                     Ok(())
                 }));

@@ -302,7 +302,7 @@ impl Encryption {
                 thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> {  
                     for (buf_in, chunk_count, final_chunk) in rx_in {
                         let buf_zip = Self::compress_buffer(&buf_in).map_err(|e| e.to_string())?;
-                        tx_c.send((buf_zip, chunk_count, final_chunk)).map_err(|e| e.to_string())?;
+                        if tx_c.send((buf_zip, chunk_count, final_chunk)).is_err() { break }
                     }
                     Ok(())
                 }));
@@ -330,7 +330,7 @@ impl Encryption {
                 for (buf_in, chunk_count, final_chunk) in rx_in {
                     let buf_cha = Self::cha_encrypt_buffer(&key_cha, &buf_in, chunk_count, final_chunk).map_err(|e| e.to_string())?;
                     let buf_aes = Self::aes_encrypt_buffer(&key_aes, &buf_cha).map_err(|e| e.to_string())?;
-                    tx_out.send((buf_aes, chunk_count)).map_err(|e| e.to_string())?;                    
+                    if tx_out.send((buf_aes, chunk_count)).is_err() { break }
                 }
                 Ok(())
             }));

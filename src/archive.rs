@@ -23,7 +23,7 @@ const ARCHIVE_HEADER_LENGTH_SIZE: usize = 2;
 pub struct ArchiveRead {
     walk_dir: IntoIter,
     f_in: Option<File>,
-    data_size: u64,
+    file_size: u64,
     buf_out: Vec<u8>,
     no_more_files: bool,
 }
@@ -34,10 +34,10 @@ impl ArchiveRead {
         let walk_dir = WalkDir::new(f_in_path).sort_by_key(|x| x.file_type().is_dir()).into_iter();
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 3);
 
-        Self { walk_dir, f_in: None, data_size: 0, buf_out, no_more_files: false }
+        Self { walk_dir, f_in: None, file_size: 0, buf_out, no_more_files: false }
     }
 
-    fn build_archive_header(entry: &walkdir::DirEntry) -> Result<(Vec<u8>, Option<std::path::PathBuf>)> {
+    fn build_archive_header(entry: &walkdir::DirEntry) -> Result<(Vec<u8>, Option<(PathBuf, u64)>)> {
         // archive header initialized with place holder for header size 
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
 
@@ -75,6 +75,8 @@ impl ArchiveRead {
         archive_header.extend(path_len.to_le_bytes());
         archive_header.extend(path_string.as_bytes());
 
+        // println!("{}", entry.path().display());
+
         // last access time 
         let time_accessed = entry.metadata()?.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
         archive_header.extend(time_accessed.to_le_bytes());
@@ -82,9 +84,10 @@ impl ArchiveRead {
         let time_modified = entry.metadata()?.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
         archive_header.extend(time_modified.to_le_bytes());
 
+        let mut file_size = 0;
         if entry.file_type().is_file() {
             // file size
-            let file_size = entry.metadata()?.len();
+            file_size = entry.metadata()?.len();
             archive_header.extend(file_size.to_le_bytes());
 
         } else if entry.file_type().is_symlink() {
@@ -111,20 +114,20 @@ impl ArchiveRead {
         archive_header[0] = header_size[0];
         archive_header[1] = header_size[1];
 
-        let mut path = None;
+        let mut filepath_and_size = None;
         if entry.file_type().is_file() {
-            path = Some(entry.clone().into_path());
+            filepath_and_size = Some((entry.clone().into_path(), file_size));
         }
 
-        Ok((archive_header, path))
+        Ok((archive_header, filepath_and_size))
     }
 
-    fn get_next_archive_item(&mut self) -> Result<(Option<Vec<u8>>, Option<std::path::PathBuf>)> {
+    fn get_next_archive_item(&mut self) -> Result<(Option<Vec<u8>>, Option<(PathBuf, u64)>)> {
         if let Some(entry) = self.walk_dir.next() {
             match &entry {
                 Ok(entry) => {
                     match Self::build_archive_header(entry) {
-                        Ok((archive_header, filepath)) => Ok((Some(archive_header), filepath)),
+                        Ok((archive_header, filepath_and_size)) => Ok((Some(archive_header), filepath_and_size)),
                         Err(e) => Err(format!("Skipped entry {}   Error: {e}", entry.path().display()).into())
                     }
                 },
@@ -147,21 +150,21 @@ impl ReadChunk for ArchiveRead {
                 return Ok((chunk, false));
             }
 
-            if self.data_size == 0 {
+            if self.file_size == 0 {
                 let archive_header; 
-                let filepath;
+                let filepath_and_size;
 
                 match self.get_next_archive_item() {
-                    Ok(values) => (archive_header, filepath) = values,
+                    Ok(values) => (archive_header, filepath_and_size) = values,
                     Err(e) => { 
                         eprintln!("{e}"); 
                         continue; 
                     }
                 }
 
-                if let Some(filepath) = &filepath {
+                if let Some((filepath, file_size)) = &filepath_and_size {
                     if let Ok(f_in) = File::open(filepath) {
-                        self.data_size = f_in.metadata()?.len();
+                        self.file_size = *file_size;
                         self.f_in = Some(f_in);
                     } else {
                         eprintln!("Could not open - skipped: {}", filepath.display());
@@ -178,11 +181,11 @@ impl ReadChunk for ArchiveRead {
                     self.no_more_files = true;
                 }
             } else {
-                let buf_len = CHUNK_SIZE.min(self.data_size.try_into()?);
+                let buf_len = CHUNK_SIZE.min(self.file_size.try_into()?);
                 let mut buf_read = vec![0u8; buf_len];
 
                 self.f_in.as_ref().unwrap().read_exact(&mut buf_read)?;
-                self.data_size -= u64::try_from(buf_len)?;
+                self.file_size -= u64::try_from(buf_len)?;
 
                 self.buf_out.extend(buf_read);
             }
@@ -250,6 +253,8 @@ impl ArchiveWrite {
         // entry's path
         let entry_path;
         (entry_path, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
+
+        // println!("{}", entry_path);
 
         // access time
         s = e; e += size_of::<u64>(); 
