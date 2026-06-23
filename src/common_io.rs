@@ -5,13 +5,14 @@ use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
 use secrecy::SecretSlice;
 use std::collections::HashMap;
-
+use num_cpus;
 
 use crate::{AES_NONCE_SIZE, AES_TAG_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, Result, SPLIT_ENC_FILE_EXT};
 
 
 pub trait ReadChunk {
     fn read_chunk(&mut self) -> Result<(Vec<u8>, bool)>;
+    fn join_threads(&mut self) -> Result<()>;
 }
 
 pub trait WriteFiles {
@@ -47,8 +48,8 @@ impl ReadInput {
     /// # Returns
     /// - `Ok(Self)` on success
     /// - `Err(...)` when an I/O or conversion error occurs
-    pub fn new(f_in_path: PathBuf, chunk_size: usize, f_in_header_size: u64) -> Result<Self> {
-        let f_in = File::open(&f_in_path)?;
+    pub fn new(f_in_path: &PathBuf, chunk_size: usize, f_in_header_size: u64) -> Result<Self> {
+        let f_in = File::open(f_in_path)?;
 
         let mut f_in_total_size = 0;
         let mut f_in_split = vec![];
@@ -74,7 +75,7 @@ impl ReadInput {
         // header was already read, therefore remaining file size must be reduced by the header's size
         let f_in_total_size_remaining = f_in_total_size - f_in_header_size;
 
-        Ok( Self { f_in, f_in_path, f_in_total_size_remaining, chunk_size, f_in_split, split_index: 0, f_in_read_count: 0 } )
+        Ok( Self { f_in, f_in_path: f_in_path.clone(), f_in_total_size_remaining, chunk_size, f_in_split, split_index: 0, f_in_read_count: 0 } )
     }
 
     /// Calculate how much need to be read for the current chunk, whether it is the final chunk
@@ -158,6 +159,11 @@ impl ReadChunk for ReadInput {
         self.read_files(&mut buf_in)?;
 
         Ok((buf_in, final_chunk))
+    }
+
+    fn join_threads(&mut self) -> Result<()> {
+        // do nothing
+        Ok(())
     }
 }
 
@@ -274,8 +280,8 @@ impl CryptIo {
             Receiver<(Vec<u8>, u32, bool)>, 
             Sender<(Vec<u8>, u32)>,
             usize) -> Vec<thread::JoinHandle<std::result::Result<(), String>>>,
-        read_input: &mut (impl ReadChunk + ?Sized),
-        mut write_output: Box<dyn WriteFiles + Send + 'static>,
+        mut read_input: Box<dyn ReadChunk>,
+        mut write_output: Box<dyn WriteFiles + Send>,
     ) -> Result<()> {
 
         let cpu_count = num_cpus::get();
@@ -313,6 +319,9 @@ impl CryptIo {
 
         drop(tx_in);
 
+        // get errors of threads spawned in ArchiveRead::new()
+        read_input.join_threads()?; 
+
         // join and error handling of file writer thread
         match writer_handle.join() {
             Ok(Ok(())) => {},
@@ -328,7 +337,8 @@ impl CryptIo {
                 Err(panic) => return Err(format!("Crypt thread panicked: {:?}", panic).into()),
             }
         }
-
+        
+       
         Ok(())
     }
 }
@@ -346,14 +356,14 @@ mod tests {
 
     #[test]
     fn test_input_sizes() {
-        let test_file = "test_input_sizes.bin";
+        let test_file = &PathBuf::from("test_input_sizes.bin");
         
         let data = vec![0u8; 100];
         fs::write(test_file, &data).unwrap();
         
         // Case 1: chunk not final
         // File size 100, header 10 -> remaining 90. Chunk 50.
-        let mut ri = ReadInput::new(PathBuf::from(test_file), 50, 10).unwrap();
+        let mut ri = ReadInput::new(test_file, 50, 10).unwrap();
         let (read_size, final_chunk) = ri.input_sizes().unwrap();
         assert_eq!(read_size, 50);
         assert!(!final_chunk);
@@ -381,21 +391,21 @@ mod tests {
 
         // only first split
         let mut buf = [0u8; 1000];
-        let f_in_path = PathBuf::from("test_split_in.c00");
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
+        let f_in_path = &PathBuf::from("test_split_in.c00");
+        let mut ri = ReadInput::new(f_in_path, 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf).unwrap();
         assert_eq!(buf, data0);
 
         // all splits
         let mut buf = [0u8; 3028];
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
+        let mut ri = ReadInput::new(f_in_path, 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf).unwrap();
         assert_eq!(buf[..], [&data0[..], &data1[..], &data2[..]].concat());
 
         // 2 reads
         let mut buf0 = [0u8; 4];
         let mut buf1 = [0u8; 2000];
-        let mut ri = ReadInput::new(f_in_path.clone(), 0, HEADER_SIZE as u64).unwrap();
+        let mut ri = ReadInput::new(f_in_path, 0, HEADER_SIZE as u64).unwrap();
         ri.read_files(&mut buf0).unwrap();
         assert_eq!(buf0[..], data0[..4]);
         ri.read_files(&mut buf1).unwrap();
@@ -475,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_read_chunk() {
-        let test_file = "test_read_chunk.bin";
+        let test_file = &PathBuf::from("test_read_chunk.bin");
 
         let data = vec![1u8; 100];
         fs::write(test_file, &data).unwrap();
@@ -485,7 +495,7 @@ mod tests {
         // Chunk 1: 40 bytes, final=false.
         // Chunk 2: 40 bytes, final=false.
         // Chunk 3: 10 bytes, final=true.
-        let mut ri = ReadInput::new(PathBuf::from(test_file), 40, 10).unwrap();
+        let mut ri = ReadInput::new(test_file, 40, 10).unwrap();
 
         // Skip header 
         let mut header = [0u8; 10];

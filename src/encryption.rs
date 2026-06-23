@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305};
@@ -355,24 +355,25 @@ impl Encryption {
     /// # Returns
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
-    pub fn encrypt(filepath_in: &Path, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>) -> Result<()> {
-        let mut filepath_out = filepath_in.to_path_buf();
+    pub fn encrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>) -> Result<()> {
+        let mut filepath_out = filepath_in.clone();
         if split.is_empty() {
             filepath_out.add_extension(ENCRYPTED_FILE_EXT);
         } else {
             filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
         }
+       
+        // ask for password, before there can be error messages of archive 
+        let (salt_pw, key) = Self::hash_password(keyfilepath)?;
+        let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
 
         let build_archive = filepath_in.is_dir();
 
-        let mut read_input: Box<dyn ReadChunk> = if build_archive {
-            Box::new( ArchiveRead::new(filepath_in) )
+        let read_input: Box<dyn ReadChunk> = if build_archive {
+            Box::new( ArchiveRead::new(filepath_in) ) 
         } else {
-            Box::new( ReadInput::new(filepath_in.to_path_buf(), CHUNK_SIZE, 0)? )
+            Box::new( ReadInput::new(filepath_in, CHUNK_SIZE, 0)? )
         };
-
-        let (salt_pw, key) = Self::hash_password(keyfilepath)?;
-        let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
 
         // file header
         //   byte  description
@@ -390,13 +391,13 @@ impl Encryption {
         header.extend(salt_cha);
         header.extend(salt_aes);
 
-         // set write parameters and create output file
+        // set write parameters and create output file
         let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
 
         // write header
         write_output.write_files(&header)?;
 
-        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input.as_mut(), write_output)?;
+        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }

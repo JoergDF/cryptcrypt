@@ -1,5 +1,5 @@
 use std::thread;
-use std::{io::Read, path::Path};
+use std::io::Read;
 use std::path::PathBuf;
 use std::collections::HashMap;
 use argon2::Argon2;
@@ -316,12 +316,12 @@ impl Decryption {
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    pub fn decrypt(filepath_in: &Path, keyfilepath: Option<&PathBuf>) -> Result<()> {
+    pub fn decrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
         }
 
-        let mut filepath_out = filepath_in.to_path_buf();
+        let mut filepath_out = filepath_in.clone();
         if filepath_in.extension() == Some(std::ffi::OsStr::new(ENCRYPTED_FILE_EXT)) ||
            filepath_in.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
             // remove encrypted-file-extension
@@ -331,11 +331,11 @@ impl Decryption {
         }
 
         // set read parameters
-        let mut read_input = ReadInput::new(
-            filepath_in.to_path_buf(), 
+        let mut read_input = Box:: new( ReadInput::new(
+            filepath_in, 
             CHUNK_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE, 
             HEADER_SIZE as u64
-        )?;
+        )? );
 
         // Read file header
         let mut header = [0u8; HEADER_SIZE];
@@ -368,7 +368,7 @@ impl Decryption {
             Box::new( WriteOutput::new(filepath_out, vec![])? )
         };
 
-        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::decrypt_pipe, &mut read_input, write_output)?;
+        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::decrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }
