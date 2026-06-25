@@ -17,6 +17,7 @@ pub trait ReadChunk {
 
 pub trait WriteFiles {
     fn write_files(&mut self, buf_in: &[u8]) -> Result<()>;
+    fn write_others(&self) -> Result<()>;
 }
 
 /// Struct for file input
@@ -247,6 +248,11 @@ impl WriteFiles for WriteOutput {
   
         Ok(())
     }
+
+    fn write_others(&self) -> Result<()> {
+        // do nothing
+        Ok(())
+    }
 }
 
 
@@ -305,6 +311,8 @@ impl CryptIo {
                     write_index += 1;
                 }
             }
+            write_output.write_others().map_err(|e| e.to_string())?;
+
             Ok(())
         });
 
@@ -337,7 +345,6 @@ impl CryptIo {
                 Err(panic) => return Err(format!("Crypt thread panicked: {:?}", panic).into()),
             }
         }
-        
        
         Ok(())
     }

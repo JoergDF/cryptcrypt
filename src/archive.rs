@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::fs::{self, File, FileTimes};
 use std::io::{Read, Write};
 use std::mem::{self, size_of};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
@@ -11,6 +9,8 @@ use walkdir::WalkDir;
 use crossbeam_channel::{Receiver, Select, TryRecvError, bounded};
 use num_cpus;
 use filetime;
+#[cfg(unix)]
+use std::collections::HashMap;
 //use drill_press::{Segments, SparseFile};
 
 use crate::common_io::{ReadChunk, WriteFiles};
@@ -21,6 +21,7 @@ const TYPE_FILE:         u8 = 0x00;
 const TYPE_DIRECTORY:    u8 = 0x01;
 const TYPE_SYMLINK_FILE: u8 = 0x02;
 const TYPE_SYMLINK_DIR:  u8 = 0x03;
+const TYPE_HARDLINK:     u8 = 0x04;
 const TYPE_UNIX:         u8 = 0x00;
 const TYPE_WINDOWS:      u8 = 0x10;
 const ARCHIVE_HEADER_LENGTH_SIZE: usize = 2;
@@ -45,10 +46,34 @@ impl ArchiveRead {
             let f_in_path = f_in_path.to_path_buf();
             let tx_paths = tx_paths.clone();
             thread_handles.push(thread::spawn(move || -> std::result::Result<(), String> {
+                #[cfg(unix)]
+                let mut hard_link_files: HashMap<u64, PathBuf> = HashMap::new();
+
                 for entry in WalkDir::new(f_in_path) {
                     match entry {
                         Ok(entry) => {
-                            let _ = tx_paths.send(entry);
+                            // check if entry is a hard link
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::MetadataExt;
+                                use walkdir::DirEntryExt;
+                                
+                                let mut hard_link_target: Option<PathBuf> = None;
+                                if entry.file_type().is_file() 
+                                    && let Ok(meta) = entry.metadata() && meta.nlink() > 1 {
+                                        let file_id = entry.ino();
+                                        if let Some(hl_target) = hard_link_files.get(&file_id) {
+                                            // entry is hard link
+                                            hard_link_target = Some(hl_target.to_owned());
+                                        } else {
+                                            // entry is taken as original file path (i.e. target of hard link)
+                                            hard_link_files.insert(file_id, entry.clone().into_path());
+                                        }
+                                }
+                                let _ = tx_paths.send((entry, hard_link_target));
+                            }
+                            #[cfg(windows)]
+                            let _ = tx_paths.send((entry, None));
                         }
                         Err(ref e) => { return Err(format!("Skipped entry {entry:?}   Error: {e}")); }
                     }
@@ -65,12 +90,12 @@ impl ArchiveRead {
             rx_out_receivers.push(rx_out);
 
             thread_handles.push(thread::spawn(move || -> std::result::Result<(), String> {
-                for entry in rx_paths {
+                for (entry, hard_link_target) in rx_paths {
                     let archive_header;
                     let filepath_and_size;
                     //let sparse_segments; //fixme
                     // println!("{:?}", entry);
-                    match Self::build_archive_header(&entry) {
+                    match Self::build_archive_header(&entry, &hard_link_target) {
                         Ok(values) => (archive_header, filepath_and_size/* , sparse_segments */) = values,
                         Err(e) => {
                             eprintln!("Skipped entry {}   - Reason: {e}", entry.path().display());
@@ -119,7 +144,7 @@ impl ArchiveRead {
                             continue;
                         }
                     } else {
-                        // send header of directory
+                        // send header of entries without additional data
                         //println!("send ah {}", archive_header.len());
                         let _ = tx_out.send((archive_header, true));
                     }
@@ -137,12 +162,23 @@ impl ArchiveRead {
         Self { thread_handles, rx_out_receivers, channel_index: None, channel_finished: vec![false; num_workers], buf_out }
     }
 
+    fn add_path_to_header(path: &Path, archive_header: &mut Vec<u8>) -> Result<()> {
+        // path length and path 
+        let path_string = path.to_string_lossy();
+        let path_len: u16 = path_string.len().try_into()?;
+        archive_header.extend(path_len.to_le_bytes());
+        archive_header.extend(path_string.as_bytes());
+        Ok(())
+    }
+
     #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &walkdir::DirEntry) -> Result<(Vec<u8>, Option<(PathBuf, u64)>/* , Vec<drill_press::Segment> */)> {
+    fn build_archive_header(entry: &walkdir::DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>/* , Vec<drill_press::Segment> */)> {
         // archive header initialized with place holder for header size
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
 
-        let entry_type = if entry.file_type().is_file() {
+        let entry_type = if hard_link_target.is_some() {
+            TYPE_HARDLINK
+        } else if entry.file_type().is_file() {
             TYPE_FILE
         } else if entry.file_type().is_dir() {
             TYPE_DIRECTORY
@@ -163,12 +199,24 @@ impl ArchiveRead {
         archive_header.push(os_type | entry_type);
 
         // path length and path (including filename)
-        let path_string = entry.path().to_string_lossy();
-        let path_len: u16 = path_string.len().try_into()?;
-        archive_header.extend(path_len.to_le_bytes());
-        archive_header.extend(path_string.as_bytes());
+        Self::add_path_to_header(entry.path(), &mut archive_header)?;
 
         // println!("{}", entry.path().display());
+
+        if entry_type == TYPE_HARDLINK {
+            
+            // target path of hard link
+            let target_path = hard_link_target.as_ref().unwrap();
+            Self::add_path_to_header(target_path, &mut archive_header)?;
+
+            // header size
+            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
+                archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
+            archive_header[0] = header_size[0];
+            archive_header[1] = header_size[1];
+
+            return Ok((archive_header, None))
+        }
 
         // last access time 
         let time_accessed = entry.metadata()?.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
@@ -201,27 +249,34 @@ impl ArchiveRead {
                 // }
                 // println!("{:?} {:?}", sparse_segments, entry.path());
             //}
+
         } else if entry_type == TYPE_SYMLINK_FILE || entry_type == TYPE_SYMLINK_DIR {
             // target path of symlink
             let target_path = fs::read_link(entry.path())?;
-            let target_path_string = target_path.to_string_lossy();
-            let target_path_len: u16 = target_path_string.len().try_into()?;
-            archive_header.extend(target_path_len.to_le_bytes());
-            archive_header.extend(target_path_string.as_bytes());
+            Self::add_path_to_header(&target_path, &mut archive_header)?;
         }
 
         // permissions
-        let mut perm: u16 = 0;
-        if os_type == TYPE_UNIX && (entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY) {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
-            let permission_mode = entry.metadata()?.permissions().mode();
-            // use 12 least significant bits
-            perm = (permission_mode & 0x0FFF) as u16;
+            
+            let mut perm: u16 = 0;
+            if entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY {
+                let permission_mode = entry.metadata()?.permissions().mode();
+                // use 12 least significant bits
+                perm = (permission_mode & 0x0FFF) as u16;
+            }
+            archive_header.extend(perm.to_le_bytes());
         }
-        archive_header.extend(perm.to_le_bytes());
+        #[cfg(windows)]
+        {
+           archive_header.extend(0u16.to_le_bytes());
+        }
 
         // header size
-        let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(archive_header.len() - 2)?.to_le_bytes();
+        let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
+            archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
         archive_header[0] = header_size[0];
         archive_header[1] = header_size[1];
 
@@ -301,14 +356,25 @@ pub struct ArchiveWrite {
     file_size: u64,
     file_times: FileTimes,
     file_path: PathBuf,
-    dir_times: HashMap<PathBuf, FileTimes>,
+    dir_times: Vec<(PathBuf, FileTimes)>,
+    pending_hardlinks: Vec<(PathBuf, PathBuf)>,
 }
 
 impl ArchiveWrite {
     pub fn new() -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
-            file_path: PathBuf::new(), dir_times: HashMap::new() }
+            file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![] }
+    }
+
+    fn create_parent_directory(entry_path: &Path) -> Result<()> {
+        // create directory, if it doesn't exists
+        // as parallel threads are used to create an archive, the sequence of entries differ from the sequence returned be walkdir
+        // hence a file, etc. might show up before its directory was created
+        if let Some(dir) = entry_path.parent() && !dir.exists() {
+            fs::create_dir_all(dir)?;
+        }
+        Ok(())
     }
 
     fn get_path_from_header(header: &[u8], current_end_index: usize, created_on_os_type: u8) -> Result<(String, usize)> {
@@ -346,7 +412,16 @@ impl ArchiveWrite {
         (entry_path_string, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
         let entry_path = PathBuf::from(&entry_path_string);
 
-        println!("{}", entry_path.display());
+        // println!("{}", entry_path.display());
+
+        if file_type == TYPE_HARDLINK {
+            // hard link's target path
+            let target_path;
+            (target_path, _) = Self::get_path_from_header(header, e, created_on_os_type)?;
+            
+            self.pending_hardlinks.push((PathBuf::from(target_path), entry_path));
+            return Ok(())
+        }
 
         // access time
         s = e; e += size_of::<u64>();
@@ -362,23 +437,16 @@ impl ArchiveWrite {
 
         // create type
         if file_type == TYPE_DIRECTORY {
+            // create directory 
+            // it could be an empty one therefore it would not be created by other entries
             fs::create_dir_all(&entry_path)?;
-            println!("D: {:?} {:?}", entry_path, self.file_times);
 
-            // set timestamps of directory
-            // if files will be added afterwards, the directory's original timestamps need to be set again
-            if !File::open(&entry_path).is_ok_and(|dir| dir.set_times(self.file_times).is_ok()) {
-                eprintln!("Could not set original timestamps for directory {}", entry_path.display());
-            }
-
-            self.dir_times.insert(entry_path.clone(), self.file_times);
+            // save timestamps for restoring them at the end
+            self.dir_times.push((entry_path.clone(), self.file_times));
 
         } else if file_type == TYPE_FILE {
             // create directory (of file), if it doesn't exists
-            if let Some(dir) = &entry_path.parent() && !dir.exists() {
-                println!("F: {:?}", dir);
-                fs::create_dir_all(dir)?;
-            }
+            Self::create_parent_directory(&entry_path)?;
 
             self.f_out = Some(File::create(&entry_path)?);
 
@@ -388,20 +456,19 @@ impl ArchiveWrite {
             // file size
             s = e; e += size_of::<u64>();
             self.file_size = u64::from_le_bytes( header[s..e].try_into()? );
+
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
             // create directory (of symlink), if it doesn't exists
-            if let Some(dir) = &entry_path.parent() && !dir.exists() {
-                println!("S: {:?}", dir);
-                fs::create_dir_all(dir)?;
-            }
+            Self::create_parent_directory(&entry_path)?;
 
             // symlink's target path
             let target_path;
             (target_path, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
 
-            // create symlink
-            // remove it, if it already exists, otherwise symlink can't be created
+            // remove symlink, if it already exists, otherwise it can't be created
             let _ = fs::remove_file(&entry_path);
+
+            // create symlink
             #[cfg(unix)]
             {
                 std::os::unix::fs::symlink(&target_path, &entry_path)?;
@@ -417,7 +484,7 @@ impl ArchiveWrite {
             }
             
             // set timestamps of symlink
-            // replace with fs::set_times_nofollow() when in stable rust version
+            // replace with fs::set_times_nofollow() when stable rust version supports it
             if filetime::set_symlink_file_times(
                 &entry_path,
                 filetime::FileTime::from_system_time(time_accessed),    
@@ -431,16 +498,26 @@ impl ArchiveWrite {
 
         // permissions
         // if this is a unix system and the archive was created on a unix system, set permission mode
-        if cfg!(unix) && created_on_os_type == TYPE_UNIX && (file_type == TYPE_DIRECTORY || file_type == TYPE_FILE)
+        #[cfg(unix)]
         {
-            s = e; e += size_of::<u16>();
-            let perm = u16::from_le_bytes(header[s..e].try_into()?);
+            use std::os::unix::fs::PermissionsExt;
 
-            let fd = File::open(&entry_path)?;
-            let mut permissions = fd.metadata()?.permissions();
-            let mode_masked = permissions.mode() & 0xFFFF_F000;
-            permissions.set_mode(mode_masked | u32::from(perm & 0x0FFF));
-            fd.set_permissions(permissions)?;
+            if created_on_os_type == TYPE_UNIX && (file_type == TYPE_DIRECTORY || file_type == TYPE_FILE) {
+                s = e; e += size_of::<u16>();
+                let perm = u16::from_le_bytes(header[s..e].try_into()?);
+
+                let fd = File::open(&entry_path)?;
+                let mut permissions = fd.metadata()?.permissions();
+                let mode_masked = permissions.mode() & 0xFFFF_F000;
+                permissions.set_mode(mode_masked | u32::from(perm & 0x0FFF));
+                fd.set_permissions(permissions)?;
+            }
+        }
+        #[cfg(windows)]
+        {
+            // keep compiler quiet
+            s = e; e += size_of::<u16>();
+            let _perm = u16::from_le_bytes(header[s..e].try_into()?);
         }
 
         Ok(())
@@ -465,15 +542,6 @@ impl WriteFiles for ArchiveWrite {
                     if f_out.set_times(self.file_times).is_err() {
                         eprintln!("Could not set original timestamps for file {}", self.file_path.display());
                     }
-                    // as a new file was created, the file's parent directory would get the current timestamp, 
-                    // but the original one is desired, therefore set original timestamp for the directory
-                    if let Some(dir_path) = self.file_path.parent() 
-                        && let Some(file_times) = self.dir_times.get(dir_path) {
-                            if !File::open(dir_path).is_ok_and(|dir| dir.set_times(*file_times).is_ok()) {
-                                eprintln!("Could not set original timestamps for directory {}", dir_path.display());
-                            }
-                    } else { /* do nothing */ }
-
                     self.file_size = 0;
                     self.f_out = None;
                 }
@@ -496,6 +564,31 @@ impl WriteFiles for ArchiveWrite {
                 break; // not enough data
             }
         }
+
+        Ok(())
+    }
+
+    fn write_others(&self) -> Result<()> {
+        // create hard links, if there are any
+        for (target_path, entry_path) in &self.pending_hardlinks {
+            // create directory (of hard link), if it doesn't exists
+            Self::create_parent_directory(entry_path)?;
+
+            // remove hard link, if it already exists, otherwise it can't be created
+            let _ = fs::remove_file(entry_path);
+
+            fs::hard_link(target_path, entry_path)?;
+        }
+
+        // set timestamps of directories
+        // need to be done after all elements have been created, as creation of an element 
+        // updates timestamp of its parent directory to now
+        for (dir_path, dir_time) in &self.dir_times {
+            if !File::open(dir_path).is_ok_and(|dir| dir.set_times(*dir_time).is_ok()) {
+                eprintln!("Could not set original timestamps for directory {}", dir_path.display());
+            } 
+        }
+
         Ok(())
     }
 }
