@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::mem::{self, size_of};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use typed_path::Utf8WindowsPath;
 use walkdir::WalkDir;
 use crossbeam_channel::{Receiver, Select, TryRecvError, bounded};
@@ -74,6 +74,7 @@ impl ArchiveRead {
                             }
                             #[cfg(windows)]
                             let _ = tx_paths.send((entry, None));
+                            // windows: use number_of_links() and file_index() of std::os::windows::fs::MetadataExt, when supported by stable rust
                         }
                         Err(ref e) => { return Err(format!("Skipped entry {entry:?}   Error: {e}")); }
                     }
@@ -356,7 +357,7 @@ pub struct ArchiveWrite {
     file_size: u64,
     file_times: FileTimes,
     file_path: PathBuf,
-    dir_times: Vec<(PathBuf, FileTimes)>,
+    dir_times: Vec<(PathBuf, SystemTime, SystemTime)>,
     pending_hardlinks: Vec<(PathBuf, PathBuf)>,
 }
 
@@ -442,7 +443,7 @@ impl ArchiveWrite {
             fs::create_dir_all(&entry_path)?;
 
             // save timestamps for restoring them at the end
-            self.dir_times.push((entry_path.clone(), self.file_times));
+            self.dir_times.push((entry_path.clone(), time_accessed, time_modified));
 
         } else if file_type == TYPE_FILE {
             // create directory (of file), if it doesn't exists
@@ -485,12 +486,13 @@ impl ArchiveWrite {
             
             // set timestamps of symlink
             // replace with fs::set_times_nofollow() when stable rust version supports it
-            if filetime::set_symlink_file_times(
+            match filetime::set_symlink_file_times(
                 &entry_path,
                 filetime::FileTime::from_system_time(time_accessed),    
                 filetime::FileTime::from_system_time(time_modified)
-            ).is_err() {
-                eprintln!("Could not set original timestamps for symlink {}", entry_path.display());
+            ) {
+                Ok(()) => {},
+                Err(e) => eprintln!("Could not set original timestamps for symlink {}: {e}", entry_path.display()),
             }
         } else {
             return Err(format!("Archive contains unknown file type: {file_type}").into());
@@ -583,10 +585,15 @@ impl WriteFiles for ArchiveWrite {
         // set timestamps of directories
         // need to be done after all elements have been created, as creation of an element 
         // updates timestamp of its parent directory to now
-        for (dir_path, dir_time) in &self.dir_times {
-            if !File::open(dir_path).is_ok_and(|dir| dir.set_times(*dir_time).is_ok()) {
-                eprintln!("Could not set original timestamps for directory {}", dir_path.display());
-            } 
+        for (dir_path, atime, mtime) in &self.dir_times {
+            match filetime::set_file_times(
+                dir_path,
+                filetime::FileTime::from_system_time(*atime),    
+                filetime::FileTime::from_system_time(*mtime)
+            ) {
+                Ok(()) => {},
+                Err(e) => eprintln!("Could not set original timestamps for directory {}: {e}", dir_path.display()),
+            };
         }
 
         Ok(())
