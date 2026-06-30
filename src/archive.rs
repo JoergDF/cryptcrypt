@@ -26,15 +26,35 @@ const TYPE_UNIX:         u8 = 0x00;
 const TYPE_WINDOWS:      u8 = 0x10;
 const ARCHIVE_HEADER_LENGTH_SIZE: usize = 2;
 
+/// Handles the reading and archiving of files/directories.
+///
+/// Walks the file system directory tree, processes files in parallel,
+/// constructs archive headers, and serves the serialized archive stream in chunks.
 pub struct ArchiveRead {
+    /// Background worker thread handles running the directory walk and processing jobs.
     pub thread_handles: Vec<thread::JoinHandle<std::result::Result<(), String>>>,
+    /// Channels receiving processed archive data blocks from the parallel worker threads.
     rx_out_receivers: Vec<Receiver<(Vec<u8>, bool)>>,
+    /// Index of the active channel currently being read.
     channel_index: Option<usize>,
+    /// Tracks which worker threads have finished processing their tasks.
     channel_finished: Vec<bool>,
+    /// Accumulates output data to be served in uniform chunks of `CHUNK_SIZE`.
     buf_out: Vec<u8>,
 }
 
 impl ArchiveRead {
+    /// Initializes the archive reading process by starting parallel worker threads.
+    ///
+    /// One worker thread walks the directory tree and sends discovered file entries and hard link
+    /// information to a channel. Multiple worker threads then process these entries, build archive
+    /// headers, read file contents, and send the formatted data to receivers.
+    ///
+    /// # Arguments
+    /// - `f_in_path`: The root path of the directory tree to archive.
+    ///
+    /// # Returns
+    /// - A new `ArchiveRead` instance.
     pub fn new(f_in_path: &Path) -> Self {
         let num_workers = num_cpus::get();
         let mut thread_handles = Vec::with_capacity(num_workers + 1);
@@ -94,7 +114,7 @@ impl ArchiveRead {
                 for (entry, hard_link_target) in rx_paths {
                     let archive_header;
                     let filepath_and_size;
-                    let sparse_segments; 
+                    let sparse_segments;
 
                     match Self::build_archive_header(&entry, &hard_link_target) {
                         Ok(values) => (archive_header, filepath_and_size, sparse_segments) = values,
@@ -112,7 +132,15 @@ impl ArchiveRead {
                                 let last_chunk = file_size == 0;
                                 let _ = tx_out.send((archive_header, last_chunk));
 
-
+                                /// Helper function to read a chunk of data from a file up to the chunk limit.
+                                ///
+                                /// # Arguments
+                                /// - `f_in`: File handle to read from.
+                                /// - `data_size`: Total remaining data size to read.
+                                ///
+                                /// # Returns
+                                /// - `Ok((buffer, remaining_size))` on success.
+                                /// - `Err` on I/O or conversion error.
                                 fn read_data(f_in: &mut File, mut data_size: u64) -> Result<(Vec<u8>, u64)> {
                                     let buf_len = CHUNK_SIZE.min(usize::try_from(data_size)?);
                                     let mut buf_read = vec![0u8; buf_len];
@@ -172,8 +200,17 @@ impl ArchiveRead {
         Self { thread_handles, rx_out_receivers, channel_index: None, channel_finished: vec![false; num_workers], buf_out }
     }
 
+    /// Appends the file path length and path string to the archive header buffer.
+    ///
+    /// # Arguments
+    /// - `path`: The file system path to encode.
+    /// - `archive_header`: The mutable buffer to append the encoded path to.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if the path length exceeds `u16` capacity.
     fn add_path_to_header(path: &Path, archive_header: &mut Vec<u8>) -> Result<()> {
-        // path length and path 
+        // path length and path
         let path_string = path.to_string_lossy();
         let path_len: u16 = path_string.len().try_into()?;
         archive_header.extend(path_len.to_le_bytes());
@@ -181,15 +218,35 @@ impl ArchiveRead {
         Ok(())
     }
 
+    /// Builds the archive header bytes for a given file system entry.
+    ///
+    /// Creates a metadata block containing file type, path, timestamps, size,
+    /// sparse segments (holes), and permissions.
+    ///
+    /// # Arguments
+    /// - `entry`: The directory entry to construct the header for.
+    /// - `hard_link_target`: Optional path pointing to the target if this is a hard link.
+    ///
+    /// # Returns
+    /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
+    /// - `Err` if metadata retrieval or OS-specific operations fail.
     #[allow(clippy::type_complexity)]
     fn build_archive_header(entry: &walkdir::DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
         // archive header initialized with place holder for header size
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
 
-        // set header size, call at end of building the header 
+        /// Computes and sets the final header size at the beginning of the header buffer.
+        /// It is called after all other header fields have been added to the header buffer.
+        ///
+        /// # Arguments
+        /// - `archive_header`: The mutable slice representing the archive header.
+        ///
+        /// # Returns
+        /// - `Ok(())` on success.
+        /// - `Err` if the header length cannot be converted to `u16`.
         fn set_header_size(archive_header: &mut [u8]) -> Result<()> {
-            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
-                archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
+            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] =
+                u16::try_from(archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
             archive_header[0] = header_size[0];
             archive_header[1] = header_size[1];
             Ok(())
@@ -223,7 +280,6 @@ impl ArchiveRead {
         // println!("{}", entry.path().display());
 
         if entry_type == TYPE_HARDLINK {
-            
             // target path of hard link
             let target_path = hard_link_target.as_ref().unwrap();
             Self::add_path_to_header(target_path, &mut archive_header)?;
@@ -231,7 +287,7 @@ impl ArchiveRead {
             // header size
             set_header_size(&mut archive_header)?;
 
-            return Ok((archive_header, None, vec![]))
+            return Ok((archive_header, None, vec![]));
         }
 
         // last access time 
@@ -247,7 +303,7 @@ impl ArchiveRead {
             // file size
             file_size = entry.metadata()?.len();
             archive_header.extend(file_size.to_le_bytes());
-            
+
             // sparse file
             // if the files can be scanned for sparse parts, the holes are saved in the archive header
             if let Ok(mut f_in) = File::open(entry.path()) 
@@ -278,7 +334,7 @@ impl ArchiveRead {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            
+
             let mut perm: u16 = 0;
             if entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY {
                 let permission_mode = entry.metadata()?.permissions().mode();
@@ -289,7 +345,7 @@ impl ArchiveRead {
         }
         #[cfg(windows)]
         {
-           archive_header.extend(0u16.to_le_bytes());
+            archive_header.extend(0u16.to_le_bytes());
         }
 
         // header size
@@ -305,6 +361,14 @@ impl ArchiveRead {
 }
 
 impl ReadChunk for ArchiveRead {
+    /// Reads a chunk of archived data, pulling from active worker channels.
+    ///
+    /// Polls channels from parallel workers and aggregates the data into `buf_out`.
+    /// Returns chunks of `CHUNK_SIZE` until all threads finish and all data is read.
+    ///
+    /// # Returns
+    /// - `Ok((chunk, last_chunk))` on success, where `last_chunk` is true if this is the final block.
+    /// - `Err` on I/O or coordination error.
     fn read_chunk(&mut self) -> Result<(Vec<u8>, bool)> {
         while !self.channel_finished.iter().all(|x| *x) && self.buf_out.len() <= CHUNK_SIZE {
             // stay on same channel until last chunk of file using a blocking receive
@@ -345,6 +409,11 @@ impl ReadChunk for ArchiveRead {
         }
     }
 
+    /// Joins all background worker threads and propagates any execution errors.
+    ///
+    /// # Returns
+    /// - `Ok(())` if all threads exited successfully.
+    /// - `Err` if any thread failed or panicked.
     fn join_threads(&mut self) -> Result<()> {
         let thread_handles = mem::take(&mut self.thread_handles);
         for th in thread_handles {
@@ -360,22 +429,41 @@ impl ReadChunk for ArchiveRead {
     }
 }
 
+/// Handles extracting and writing archived entries back to the file system.
+///
+/// Decodes the incoming archive stream, creating files, directories, symlinks,
+/// and hard links, restoring their permissions and timestamps.
 #[derive(Default)]
 pub struct ArchiveWrite {
+    /// Active file handle for the entry currently being written.
     f_out: Option<File>,
+    /// Internal buffer containing data received from the decryption stream.
     buf_out: Vec<u8>,
+    /// Length of the header currently being processed.
     header_length: Option<usize>,
+    /// Total bytes remaining to be written for the current file.
     file_size: u64,
+    /// Timestamps (accessed, modified) of the current file being written.
     file_times: FileTimes,
+    /// Path of the current file being written.
     file_path: PathBuf,
+    /// List of directories and their original timestamps to be restored after extraction completes.
     dir_times: Vec<(PathBuf, SystemTime, SystemTime)>,
+    /// List of pending hard link creations (target, link_path) to execute after extraction.
     pending_hardlinks: Vec<(PathBuf, PathBuf)>,
+    /// Scanned sparse segments (data/hole) for the current sparse file.
     sparse_segments: Vec<Segment>,
+    /// Index of the current sparse segment being written.
     sparse_segments_index: usize,
+    /// Size in bytes of the current sparse data segment.
     data_segment_size: u64,
 }
 
 impl ArchiveWrite {
+    /// Initializes a new, empty `ArchiveWrite` instance.
+    ///
+    /// # Returns
+    /// - A default `ArchiveWrite` with allocated output buffer.
     pub fn new() -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
@@ -383,16 +471,38 @@ impl ArchiveWrite {
             sparse_segments_index: 0, data_segment_size: 0}
     }
 
+    /// Ensures that the parent directory of the given path exists.
+    ///
+    /// Creates the parent directory recursively if it does not already exist.
+    /// As parallel threads are used to create an archive, the sequence of entries differ from the
+    /// sequence returned by walkdir, hence a file, etc. might show up before its directory was created.
+    ///
+    /// # Arguments
+    /// - `entry_path`: The file system path whose parent directory should be created.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` on file system creation failure.
     fn create_parent_directory(entry_path: &Path) -> Result<()> {
-        // create directory, if it doesn't exists
-        // as parallel threads are used to create an archive, the sequence of entries differ from the sequence returned be walkdir
-        // hence a file, etc. might show up before its directory was created
         if let Some(dir) = entry_path.parent() && !dir.exists() {
             fs::create_dir_all(dir)?;
         }
         Ok(())
     }
 
+    /// Parses a file path from the archive header slice.
+    ///
+    /// Reads the path length, extracts the path bytes, converts Windows path separators
+    /// to Unix format if running on Unix, and returns the path string along with the new end index.
+    ///
+    /// # Arguments
+    /// - `header`: The archive header bytes.
+    /// - `current_end_index`: The starting index in the header to read from.
+    /// - `created_on_os_type`: OS type flag indicating which system the archive was created on.
+    ///
+    /// # Returns
+    /// - `Ok((parsed_path, next_index))` on success.
+    /// - `Err` on parse or UTF-8 decoding failure.
     fn get_path_from_header(header: &[u8], current_end_index: usize, created_on_os_type: u8) -> Result<(String, usize)> {
         // new start index of header field
         let mut s = current_end_index;
@@ -415,9 +525,16 @@ impl ArchiveWrite {
         Ok((entry_path, e))
     }
 
-    // On Windows set sparse flag for a sparse file
+    /// Configures a file as a sparse file on Windows.
+    ///
+    /// # Arguments
+    /// - `file`: Reference to the file to set as sparse.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if the system call fails.
     #[cfg(windows)]
-    fn set_files_sparse_win(file: &File)-> std::io::Result<()> {
+    fn set_files_sparse_win(file: &File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use winapi::um::ioapiset::DeviceIoControl;
         use winapi::um::winioctl::FSCTL_SET_SPARSE;
@@ -443,7 +560,17 @@ impl ArchiveWrite {
         Ok(())
     }
 
-
+    /// Evaluates a parsed archive header to create the corresponding file system entry.
+    ///
+    /// Handles directories, files (including sparse configuration), symlinks, and hard links.
+    /// Sets file size, times, and system-level permissions depending on OS.
+    ///
+    /// # Arguments
+    /// - `header`: The raw header bytes.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` on creation, I/O, or permission errors.
     fn eval_header(&mut self, header: &[u8]) -> Result<()> {
         // type
         let file_type          = header[0] & 0x0F;
@@ -465,7 +592,7 @@ impl ArchiveWrite {
             (target_path, _) = Self::get_path_from_header(header, e, created_on_os_type)?;
             
             self.pending_hardlinks.push((PathBuf::from(target_path), entry_path));
-            return Ok(())
+            return Ok(());
         }
 
         // access time
@@ -482,7 +609,7 @@ impl ArchiveWrite {
 
         // create type
         if file_type == TYPE_DIRECTORY {
-            // create directory 
+            // create directory
             // it could be an empty one therefore it would not be created by other entries
             fs::create_dir_all(&entry_path)?;
 
@@ -534,7 +661,6 @@ impl ArchiveWrite {
                 Self::set_files_sparse_win(&file)?;
             }
             
-
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
             // create directory (of symlink), if it doesn't exists
             Self::create_parent_directory(&entry_path)?;
@@ -560,7 +686,7 @@ impl ArchiveWrite {
                     std::os::windows::fs::symlink_dir(&target_path, &entry_path)?;
                 }
             }
-            
+
             // set timestamps of symlink
             // replace with fs::set_times_nofollow() when stable rust version supports it
             match filetime::set_symlink_file_times(
@@ -604,12 +730,23 @@ impl ArchiveWrite {
 }
 
 impl WriteFiles for ArchiveWrite {
+    /// Processes incoming stream data and writes it to the current active file.
+    ///
+    /// Handles headers to initialize files, parses sparse segments, and writes
+    /// data chunks. Performs physical file creation and metadata restoration.
+    ///
+    /// # Arguments
+    /// - `buf_in`: Raw input byte slice.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` on writing, seeking, or parsing failure.
     fn write_files(&mut self, buf_in: &[u8]) -> Result<()> {
         self.buf_out.extend(buf_in);
 
         loop {
             if let Some(mut f_out) = self.f_out.as_ref() {
-
+                // Local helper closure to write buffered data to file
                 let mut write_data = |f_out_size: u64| -> Result<u64> {
                     let data_size = self.buf_out.len().min(f_out_size.try_into()?);
                     let buf_out_slice: Vec<u8> = self.buf_out.drain(..data_size).collect();
@@ -633,7 +770,7 @@ impl WriteFiles for ArchiveWrite {
                             if self.data_segment_size == 0 {
                                 self.data_segment_size = segment.len();
                             }
-                            
+
                             let write_size = write_data(self.data_segment_size)?;
                             self.data_segment_size -= write_size;
                             self.file_size -= write_size;
@@ -649,7 +786,7 @@ impl WriteFiles for ArchiveWrite {
                             self.sparse_segments_index += 1;
                         }
                     }
-                    
+
                     if self.file_size == 0 {
                         self.data_segment_size = 0;
                         self.sparse_segments_index = 0;
@@ -695,6 +832,15 @@ impl WriteFiles for ArchiveWrite {
         Ok(())
     }
 
+    /// Finalizes the extraction process by completing delayed operations.
+    ///
+    /// Creates any pending hard links and restores directory timestamps. These operations
+    /// are deferred until the end of extraction to prevent sub-file creations from altering parent
+    /// directory timestamps.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if hard link creation or timestamp updates fail.
     fn write_others(&self) -> Result<()> {
         // create hard links, if there are any
         for (target_path, entry_path) in &self.pending_hardlinks {
@@ -708,13 +854,13 @@ impl WriteFiles for ArchiveWrite {
         }
 
         // set timestamps of directories
-        // need to be done after all elements have been created, as creation of an element 
+        // need to be done after all elements have been created, as creation of an element
         // updates timestamp of its parent directory to now
         for (dir_path, atime, mtime) in &self.dir_times {
             // supports Windows and Unix
             match filetime::set_file_times(
                 dir_path,
-                filetime::FileTime::from_system_time(*atime),    
+                filetime::FileTime::from_system_time(*atime),
                 filetime::FileTime::from_system_time(*mtime)
             ) {
                 Ok(()) => {},
