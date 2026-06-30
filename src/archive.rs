@@ -1,5 +1,5 @@
 use std::fs::{self, File, FileTimes};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::mem::{self, size_of};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -11,7 +11,7 @@ use num_cpus;
 use filetime;
 #[cfg(unix)]
 use std::collections::HashMap;
-//use drill_press::{Segments, SparseFile};
+use drill_press::{SegmentType, Segment, Segments, SparseFile};
 
 use crate::common_io::{ReadChunk, WriteFiles};
 use crate::{CHUNK_SIZE, Result};
@@ -36,7 +36,7 @@ pub struct ArchiveRead {
 
 impl ArchiveRead {
     pub fn new(f_in_path: &Path) -> Self {
-        let num_workers = num_cpus::get(); // fixme: too much cpus? -1 for walkdir, and what about bzip,crypt?
+        let num_workers = num_cpus::get();
         let mut thread_handles = Vec::with_capacity(num_workers + 1);
         let mut rx_out_receivers = Vec::with_capacity(num_workers);
 
@@ -76,7 +76,7 @@ impl ArchiveRead {
                             let _ = tx_paths.send((entry, None));
                             // windows: use number_of_links() and file_index() of std::os::windows::fs::MetadataExt, when supported by stable rust
                         }
-                        Err(ref e) => { return Err(format!("Skipped entry {entry:?}   Error: {e}")); }
+                        Err(ref e) => { eprintln!("Skipped entry while walking directory tree - Reason: {e}"); }
                     }
                 }
                 Ok(())
@@ -94,65 +94,74 @@ impl ArchiveRead {
                 for (entry, hard_link_target) in rx_paths {
                     let archive_header;
                     let filepath_and_size;
-                    //let sparse_segments; //fixme
-                    // println!("{:?}", entry);
+                    let sparse_segments; 
+
                     match Self::build_archive_header(&entry, &hard_link_target) {
-                        Ok(values) => (archive_header, filepath_and_size/* , sparse_segments */) = values,
+                        Ok(values) => (archive_header, filepath_and_size, sparse_segments) = values,
                         Err(e) => {
-                            eprintln!("Skipped entry {}   - Reason: {e}", entry.path().display());
+                            eprintln!("Skipped entry on building archive header for {} - Reason: {e}", entry.path().display());
                             continue;
                         }
                     }
 
                     if let Some((filepath, mut file_size)) = filepath_and_size {
-                        if let Ok(mut f_in) = File::open(&filepath) {
-                            //println!("send fah {} {}", archive_header.len(), file_size);
-
-                            // send header of file
-                            // empty files (with length 0), must set last_chunk to true
-                            let last_chunk = file_size == 0;
-                            let _ = tx_out.send((archive_header, last_chunk));
-
-                            // if file_size == 0 { continue; }
-                            // fixme
-                            // let seg_data_size: u64 = sparse_segments.data().map(|sd| sd.end - sd.start).sum();
-                            // let mut data_size = if sparse_segments.is_empty() {
-                            //     file_size
-                            // } else {
-                            //     seg_data_size
-                            // };
-
-                            // while data_size != 0 {
-                            //     let buf_len = CHUNK_SIZE.min(usize::try_from(data_size).map_err(|e| e.to_string())?);
-                            //     let mut buf_read = vec![0u8; buf_len];
-                            // }
-
-
-                            // read file and send its data
-                            while file_size != 0 {
-                                let buf_len = CHUNK_SIZE.min(usize::try_from(file_size).map_err(|e| e.to_string())?);
-                                let mut buf_read = vec![0u8; buf_len];
-
-                                f_in.read_exact(&mut buf_read).map_err(|e| e.to_string())?;
-                                file_size -= buf_len as u64;
-
+                        match File::open(&filepath) {
+                            Ok(mut f_in) => {
+                                // send header of file
+                                // empty files (with length 0), must set last_chunk to true
                                 let last_chunk = file_size == 0;
-                                let _ = tx_out.send((buf_read, last_chunk));
-                                //println!("{:?} {} {} {}", filepath, file_size, buf_len, last_chunk);
-                            }
-                        } else {
-                            eprintln!("Could not open - skipped: {}", filepath.display());
-                            continue;
+                                let _ = tx_out.send((archive_header, last_chunk));
+
+
+                                fn read_data(f_in: &mut File, mut data_size: u64) -> Result<(Vec<u8>, u64)> {
+                                    let buf_len = CHUNK_SIZE.min(usize::try_from(data_size)?);
+                                    let mut buf_read = vec![0u8; buf_len];
+                                    f_in.read_exact(&mut buf_read)?;
+                                    data_size -= buf_len as u64;
+                                    Ok((buf_read, data_size))
+                                }
+
+                                if sparse_segments.is_empty() {
+                                    // read file and send its data
+                                    while file_size != 0 {
+                                        let buf_read;
+                                        (buf_read, file_size) = read_data(&mut f_in, file_size).map_err(|e| e.to_string())?;
+                                        let last_chunk = file_size == 0;
+                                        let _ = tx_out.send((buf_read, last_chunk));
+                                    }
+                                } else {
+                                    // read/skip segments of a sparse file and send its data
+                                    for (idx, seg) in sparse_segments.iter().enumerate() {
+                                        let last_segment = (sparse_segments.len() - 1) == idx;
+                                        if seg.is_data() {
+                                            let mut seg_size = seg.len();
+                                            while seg_size != 0 {
+                                                let buf_read;
+                                                (buf_read, seg_size) = read_data(&mut f_in, seg_size).map_err(|e| e.to_string())?;
+                                                let last_chunk = seg_size == 0 && last_segment;
+                                                let _ = tx_out.send((buf_read, last_chunk));
+                                            }
+                                        } else { // hole
+                                            f_in.seek_relative(
+                                                i64::try_from( seg.len() ).map_err(|e| e.to_string())? 
+                                            ).map_err(|e| e.to_string())?;
+                                            if last_segment {
+                                                let _ = tx_out.send((vec![], true));
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Skipped entry on opening file {} - Reason: {e}", filepath.display());
+                                continue;
+                            },
                         }
                     } else {
                         // send header of entries without additional data
-                        //println!("send ah {}", archive_header.len());
                         let _ = tx_out.send((archive_header, true));
                     }
                 }
-                //println!("DONE"); // {}", rx_out_receivers.clone().len());
-                // all entries done, send finish message
-                //let _ = tx_out.send((Vec::new(), true));
 
                 Ok(())
             }));
@@ -173,9 +182,18 @@ impl ArchiveRead {
     }
 
     #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &walkdir::DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>/* , Vec<drill_press::Segment> */)> {
+    fn build_archive_header(entry: &walkdir::DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
         // archive header initialized with place holder for header size
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
+
+        // set header size, call at end of building the header 
+        fn set_header_size(archive_header: &mut [u8]) -> Result<()> {
+            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
+                archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
+            archive_header[0] = header_size[0];
+            archive_header[1] = header_size[1];
+            Ok(())
+        }
 
         let entry_type = if hard_link_target.is_some() {
             TYPE_HARDLINK
@@ -193,7 +211,7 @@ impl ArchiveRead {
                 TYPE_SYMLINK_FILE
             }
         } else {
-            return Err(format!("Ignored unsupported file type for archive: {}", entry.path().display()).into());
+            return Err("Unsupported file type".into());
         };
 
         let os_type = if cfg!(unix) { TYPE_UNIX } else { TYPE_WINDOWS };
@@ -211,12 +229,9 @@ impl ArchiveRead {
             Self::add_path_to_header(target_path, &mut archive_header)?;
 
             // header size
-            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
-                archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
-            archive_header[0] = header_size[0];
-            archive_header[1] = header_size[1];
+            set_header_size(&mut archive_header)?;
 
-            return Ok((archive_header, None))
+            return Ok((archive_header, None, vec![]))
         }
 
         // last access time 
@@ -227,29 +242,31 @@ impl ArchiveRead {
         archive_header.extend(time_modified.to_le_bytes());
 
         let mut file_size = 0;
-        //let mut sparse_segments = vec![];
+        let mut sparse_segments = vec![];
         if entry_type == TYPE_FILE {
             // file size
             file_size = entry.metadata()?.len();
             archive_header.extend(file_size.to_le_bytes());
             
-            // get holes of sparse files
-            //if file_size > 0 { // fixme
-                // if let Ok(mut f_in) = File::open(&entry.path()) {
-                //     sparse_segments = f_in.scan_chunks()?;
+            // sparse file
+            // if the files can be scanned for sparse parts, the holes are saved in the archive header
+            if let Ok(mut f_in) = File::open(entry.path()) 
+            && let Ok(segs) = f_in.scan_chunks() {
+                sparse_segments = segs;            
+                
+                // println!("{}  {:?}", entry.path().display(), sparse_segments);
 
-                //     archive_header.extend( u32::try_from(sparse_segments.holes().count())?.to_le_bytes() );
+                // number of holes
+                let holes_count = sparse_segments.holes().count();
+                archive_header.extend(u16::try_from( holes_count )?.to_le_bytes());
 
-                //     for hole in sparse_segments.holes() {
-                //         archive_header.extend(hole.start.to_le_bytes());
-                //         archive_header.extend(hole.end.to_le_bytes());
-                //     }
-                // } else {
-                //     // could not open file, add 0 holes   fixme: correct?
-                //     archive_header.extend( 0u32.to_le_bytes() );
-                // }
-                // println!("{:?} {:?}", sparse_segments, entry.path());
-            //}
+                // start and end index of holes, if any
+                for hole in sparse_segments.holes() {
+                    // start and end are of type u64
+                    archive_header.extend(hole.start.to_le_bytes());
+                    archive_header.extend(hole.end.to_le_bytes());
+                }
+            }
 
         } else if entry_type == TYPE_SYMLINK_FILE || entry_type == TYPE_SYMLINK_DIR {
             // target path of symlink
@@ -276,17 +293,14 @@ impl ArchiveRead {
         }
 
         // header size
-        let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] = u16::try_from(
-            archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
-        archive_header[0] = header_size[0];
-        archive_header[1] = header_size[1];
+        set_header_size(&mut archive_header)?;
 
         let mut filepath_and_size = None;
         if entry_type == TYPE_FILE {
             filepath_and_size = Some((entry.clone().into_path(), file_size));
         }
 
-        Ok((archive_header, filepath_and_size/* , sparse_segments */))
+        Ok((archive_header, filepath_and_size, sparse_segments))
     }
 }
 
@@ -297,7 +311,6 @@ impl ReadChunk for ArchiveRead {
             if let Some(channel_index) = self.channel_index
                 && let Ok((data, last_chunk)) = self.rx_out_receivers[channel_index].recv()
             {
-                //println!("cont recv, dat_len: {}, l {}", data.len(), last_chunk);
                 self.buf_out.extend(data);
                 if last_chunk {
                     self.channel_index = None;
@@ -311,10 +324,8 @@ impl ReadChunk for ArchiveRead {
             }
 
             let sel_rdy_idx = sel.ready();
-            //println!("sel_rdy_idx {}", sel_rdy_idx);
             match self.rx_out_receivers[sel_rdy_idx].try_recv() {
                 Ok((data, last_chunk)) => {
-                    // println!("recv {}, dat_len: {}, l {}", sel_rdy_idx, data.len(), last_chunk);
                     self.buf_out.extend(data);
                     if !last_chunk {
                         self.channel_index = Some(sel_rdy_idx);
@@ -359,13 +370,17 @@ pub struct ArchiveWrite {
     file_path: PathBuf,
     dir_times: Vec<(PathBuf, SystemTime, SystemTime)>,
     pending_hardlinks: Vec<(PathBuf, PathBuf)>,
+    sparse_segments: Vec<Segment>,
+    sparse_segments_index: usize,
+    data_segment_size: u64,
 }
 
 impl ArchiveWrite {
     pub fn new() -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
-            file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![] }
+            file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![], sparse_segments: vec![],
+            sparse_segments_index: 0, data_segment_size: 0}
     }
 
     fn create_parent_directory(entry_path: &Path) -> Result<()> {
@@ -399,6 +414,35 @@ impl ArchiveWrite {
 
         Ok((entry_path, e))
     }
+
+    // On Windows set sparse flag for a sparse file
+    #[cfg(windows)]
+    fn set_files_sparse_win(file: &File)-> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use winapi::um::ioapiset::DeviceIoControl;
+        use winapi::um::winioctl::FSCTL_SET_SPARSE;
+
+        let handle = file.as_raw_handle();
+        let mut bytes_returned = 0;
+        unsafe {
+            let result = DeviceIoControl(
+                handle as _,
+                FSCTL_SET_SPARSE,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            );
+
+            if result == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
 
     fn eval_header(&mut self, header: &[u8]) -> Result<()> {
         // type
@@ -449,7 +493,8 @@ impl ArchiveWrite {
             // create directory (of file), if it doesn't exists
             Self::create_parent_directory(&entry_path)?;
 
-            self.f_out = Some(File::create(&entry_path)?);
+            let file = File::create(&entry_path)?;
+            self.f_out = Some(file.try_clone()?);
 
             // for error handling
             self.file_path = entry_path.clone();
@@ -457,6 +502,38 @@ impl ArchiveWrite {
             // file size
             s = e; e += size_of::<u64>();
             self.file_size = u64::from_le_bytes( header[s..e].try_into()? );
+
+            // holes of a sparse file
+            s = e; e += size_of::<u16>();
+            let holes_count = u16::from_le_bytes( header[s..e].try_into()? );
+
+            if holes_count > 0 {
+                // restore data- and hole-segments of sparse file
+                let mut data_start = 0;
+                for _ in 0..holes_count {
+                    s = e; e += size_of::<u64>();
+                    let hole_start = u64::from_le_bytes( header[s..e].try_into()? );
+                    s = e; e += size_of::<u64>();
+                    let hole_end = u64::from_le_bytes( header[s..e].try_into()? );
+
+                    if hole_start != 0 {
+                        // if first segment is not a hole, add a data segment
+                        self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..hole_start} );
+                    }
+                    self.sparse_segments.push( Segment { segment_type: SegmentType::Hole, range: hole_start..hole_end } );
+                    data_start = hole_end;
+                }
+                // if last segment is not a hole, add a data segment
+                if data_start != self.file_size {
+                    self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
+                }
+                // println!("{:?} {:?}", entry_path.display(), self.sparse_segments);
+
+                // Windows requires to set sparse flag for a sparse file
+                #[cfg(windows)]
+                Self::set_files_sparse_win(&file)?;
+            }
+            
 
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
             // create directory (of symlink), if it doesn't exists
@@ -530,23 +607,71 @@ impl WriteFiles for ArchiveWrite {
     fn write_files(&mut self, buf_in: &[u8]) -> Result<()> {
         self.buf_out.extend(buf_in);
 
-        while !self.buf_out.is_empty() {
+        loop {
             if let Some(mut f_out) = self.f_out.as_ref() {
-                // write to file
-                if (self.buf_out.len() as u64) < self.file_size {
-                    f_out.write_all(&self.buf_out)?;
-                    self.file_size -= self.buf_out.len() as u64;
-                    self.buf_out.clear();
+
+                let mut write_data = |f_out_size: u64| -> Result<u64> {
+                    let data_size = self.buf_out.len().min(f_out_size.try_into()?);
+                    let buf_out_slice: Vec<u8> = self.buf_out.drain(..data_size).collect();
+                    f_out.write_all(&buf_out_slice)?;
+                    Ok(data_size as u64)
+                };
+
+                if self.sparse_segments.is_empty() {
+                    // write non-sparse file
+                    let write_size = write_data(self.file_size)?;
+                    self.file_size -= write_size;
+                    if self.buf_out.is_empty() {
+                        break;
+                    }
                 } else {
-                    let file_data: Vec<u8> = self.buf_out.drain(..usize::try_from(self.file_size)?).collect();
-                    f_out.write_all(&file_data)?;
+                    // write sparse file
+                    let segment = &self.sparse_segments[self.sparse_segments_index];
+
+                    match segment.segment_type {
+                        SegmentType::Data => {
+                            if self.data_segment_size == 0 {
+                                self.data_segment_size = segment.len();
+                            }
+                            
+                            let write_size = write_data(self.data_segment_size)?;
+                            self.data_segment_size -= write_size;
+                            self.file_size -= write_size;
+                            if self.data_segment_size == 0 {
+                                self.sparse_segments_index += 1;
+                            }
+                        }
+                        SegmentType::Hole => {
+                            f_out.seek_relative((segment.len() - 1).try_into()?)?;
+                            f_out.write_all(&[0])?;
+                            f_out.drill_hole(segment.range.start, segment.range.end)?;
+                            self.file_size -= segment.len();
+                            self.sparse_segments_index += 1;
+                        }
+                    }
+                    
+                    if self.file_size == 0 {
+                        self.data_segment_size = 0;
+                        self.sparse_segments_index = 0;
+                        self.sparse_segments.clear();
+                    }
+
+                    // no data left and no hole as next segment
+                    if self.buf_out.is_empty() 
+                    && self.sparse_segments_index < self.sparse_segments.len()
+                    && self.sparse_segments[self.sparse_segments_index].segment_type != SegmentType::Hole {
+                        break;
+                    }
+                }
+
+                if self.file_size == 0 {
                     // set file times after all data has been written
                     if f_out.set_times(self.file_times).is_err() {
                         eprintln!("Could not set original timestamps for file {}", self.file_path.display());
                     }
-                    self.file_size = 0;
                     self.f_out = None;
                 }
+                
             } else if let Some(header_length) = self.header_length {
                 if self.buf_out.len() >= header_length {
                     // get header
@@ -586,6 +711,7 @@ impl WriteFiles for ArchiveWrite {
         // need to be done after all elements have been created, as creation of an element 
         // updates timestamp of its parent directory to now
         for (dir_path, atime, mtime) in &self.dir_times {
+            // supports Windows and Unix
             match filetime::set_file_times(
                 dir_path,
                 filetime::FileTime::from_system_time(*atime),    
