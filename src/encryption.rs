@@ -806,6 +806,45 @@ mod tests {
         let _ = fs::remove_file("test_cc_split.bin.c03");
     }
 
+      #[test]
+    fn test_crypt_archive() {
+        // Create directory with files that should be archived
+        let dir_path = PathBuf::from("test_archive_toplevel");
+        fs::create_dir_all(&dir_path).unwrap();
+        
+        let file1 = dir_path.join("file1.bin");
+        let mut data1 = vec![0; CHUNK_SIZE * 10 + 12345];
+        rand::rng().fill_bytes(&mut data1);
+        fs::write(&file1, &data1).unwrap();
+
+        let file2 = dir_path.join("file2.bin");
+        let mut data2 = vec![0; CHUNK_SIZE];
+        rand::rng().fill_bytes(&mut data2);
+        fs::write(&file2, &data2).unwrap();
+
+        // Build archive of directory and encrypt it
+        Encryption::encrypt(&dir_path, None, false, vec![]).unwrap();
+
+        // Delete the original files before extracting to verify recreation
+        fs::remove_dir_all(&dir_path).unwrap();
+        assert!(!dir_path.exists());
+        
+        // Decrypt and rebuild archived directory
+        let arch_path = dir_path.with_extension(ENCRYPTED_FILE_EXT);
+        Decryption::decrypt(&arch_path, None).unwrap();
+
+        // Verify structure is fully recreated
+        assert!(dir_path.exists());
+        assert!(file1.exists());
+        assert!(file2.exists());
+
+        // Verify contents
+        assert_eq!(fs::read(&file1).unwrap(), data1);
+        assert_eq!(fs::read(&file2).unwrap(), data2);
+
+        let _ = fs::remove_dir_all(&dir_path);
+    }
+
     #[test]
     #[ignore="only for benchmarking"]
     fn test_crypt_bench() {

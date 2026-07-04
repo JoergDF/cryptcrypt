@@ -310,7 +310,7 @@ impl ArchiveRead {
             && let Ok(segs) = f_in.scan_chunks() {
                 sparse_segments = segs;            
                 
-                // println!("{}  {:?}", entry.path().display(), sparse_segments);
+                println!("arch: {}  {:?}", entry.path().display(), sparse_segments);
 
                 // number of holes
                 let holes_count = sparse_segments.holes().count();
@@ -534,7 +534,7 @@ impl ArchiveWrite {
     /// - `Ok(())` on success.
     /// - `Err` if the system call fails.
     #[cfg(windows)]
-    fn set_files_sparse_win(file: &File) -> std::io::Result<()> {
+    fn set_sparse_file_on_windows(file: &File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
         use winapi::um::ioapiset::DeviceIoControl;
         use winapi::um::winioctl::FSCTL_SET_SPARSE;
@@ -620,10 +620,10 @@ impl ArchiveWrite {
             // create directory (of file), if it doesn't exists
             Self::create_parent_directory(&entry_path)?;
 
-            let file = File::create(&entry_path)?;
-            self.f_out = Some(file.try_clone()?);
+            // create file
+            self.f_out = Some(File::create(&entry_path)?);
 
-            // for error handling
+            // for printing errors
             self.file_path = entry_path.clone();
 
             // file size
@@ -654,11 +654,11 @@ impl ArchiveWrite {
                 if data_start != self.file_size {
                     self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
                 }
-                // println!("{:?} {:?}", entry_path.display(), self.sparse_segments);
+                println!("unar: {:?} {:?}", entry_path.display(), self.sparse_segments);
 
                 // Windows requires to set sparse flag for a sparse file
                 #[cfg(windows)]
-                Self::set_files_sparse_win(&file)?;
+                Self::set_sparse_file_on_windows(self.f_out.as_ref().unwrap())?;
             }
             
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
@@ -770,7 +770,7 @@ impl WriteFiles for ArchiveWrite {
                             if self.data_segment_size == 0 {
                                 self.data_segment_size = segment.len();
                             }
-
+                            
                             let write_size = write_data(self.data_segment_size)?;
                             self.data_segment_size -= write_size;
                             self.file_size -= write_size;
@@ -781,13 +781,17 @@ impl WriteFiles for ArchiveWrite {
                         SegmentType::Hole => {
                             f_out.seek_relative((segment.len() - 1).try_into()?)?;
                             f_out.write_all(&[0])?;
-                            f_out.drill_hole(segment.range.start, segment.range.end)?;
                             self.file_size -= segment.len();
                             self.sparse_segments_index += 1;
                         }
                     }
 
                     if self.file_size == 0 {
+                        // holes must not be set before the whole file was written
+                        for hole in self.sparse_segments.holes() {
+                            f_out.drill_hole(hole.start, hole.end)?;
+                        }
+
                         self.data_segment_size = 0;
                         self.sparse_segments_index = 0;
                         self.sparse_segments.clear();
@@ -871,3 +875,454 @@ impl WriteFiles for ArchiveWrite {
         Ok(())
     }
 }
+
+
+
+// ======================================================================
+// Unit tests
+// ======================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+    use std::time::UNIX_EPOCH;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(dirname: &str) -> Self {
+            let path = PathBuf::from(dirname);
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn test_add_path_to_header() {
+        let mut buf = Vec::new();
+        ArchiveRead::add_path_to_header(Path::new("hello/world.txt"), &mut buf).unwrap();
+        
+        // Path length should be 15 (2 bytes, little-endian)
+        let expected_len = 15u16.to_le_bytes();
+        assert_eq!(buf[0..2], expected_len);
+        assert_eq!(&buf[2..], b"hello/world.txt");
+    }
+
+    #[test]
+    fn test_create_parent_directory() {
+        let temp_dir = TestDir::new("test_archive_create_parent_dir");
+        let nested_file = temp_dir.path.join("a/b/c/file.txt");
+        assert!(!nested_file.parent().unwrap().exists());
+        
+        ArchiveWrite::create_parent_directory(&nested_file).unwrap();
+        assert!(nested_file.parent().unwrap().exists());
+
+        let nested_file2 = temp_dir.path.join("a/b/c/file2.txt");
+        assert!(nested_file2.parent().unwrap().exists());
+        ArchiveWrite::create_parent_directory(&nested_file2).unwrap();
+        assert!(nested_file2.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_get_path_from_header() {
+        // Test standard unix path decoding
+        let mut header = Vec::new();
+        let path_str = "foo/bar/baz.txt";
+        let path_len = path_str.len() as u16;
+        header.extend_from_slice(&path_len.to_le_bytes());
+        header.extend_from_slice(path_str.as_bytes());
+
+        let (decoded, end_idx) = ArchiveWrite::get_path_from_header(&header, 0, TYPE_UNIX).unwrap();
+        assert_eq!(decoded, "foo/bar/baz.txt");
+        assert_eq!(end_idx, header.len());
+
+        // Test Windows path on Unix system decoding conversion
+        let mut header_win = Vec::new();
+        let path_str_win = "foo\\bar\\baz.txt";
+        let path_len_win = path_str_win.len() as u16;
+        header_win.extend_from_slice(&path_len_win.to_le_bytes());
+        header_win.extend_from_slice(path_str_win.as_bytes());
+
+        let (decoded_win, end_idx_win) = ArchiveWrite::get_path_from_header(&header_win, 0, TYPE_WINDOWS).unwrap();
+        if cfg!(unix) {
+            assert_eq!(decoded_win, "foo/bar/baz.txt");
+        } else {
+            assert_eq!(decoded_win, "foo\\bar\\baz.txt");
+        }
+        assert_eq!(end_idx_win, header_win.len());
+    }
+
+    #[test]
+    fn test_archive_read_write() {
+        let src_dir = TestDir::new("test_archive_src");
+
+        // Create standard folder and file
+        let file1_path = src_dir.path.join("file1.txt");
+        let content1 = b"Hello from file 1!";
+        fs::write(&file1_path, content1).unwrap();
+
+        // Create empty file
+        let empty_file_path = src_dir.path.join("empty.txt");
+        fs::write(&empty_file_path, b"").unwrap();
+
+        // Create nested folder and file
+        let sub_dir = src_dir.path.join("subdir");
+        fs::create_dir(&sub_dir).unwrap();
+        let file2_path = sub_dir.join("file2.bin");
+        let content2 = vec![0xAA; 5000];
+        fs::write(&file2_path, &content2).unwrap();
+
+        // Create sparse file
+        let sparse_path = src_dir.path.join("sparse.bin");
+        {
+            let mut f = File::create(&sparse_path).unwrap();
+
+            #[cfg(windows)]
+            ArchiveWrite::set_sparse_file_on_windows(&f).unwrap();
+
+            // Write 64KB of data at start
+            let start_data = vec![1u8; 65536];
+            f.write_all(&start_data).unwrap();
+
+            // Seek to 128KB and write 64KB of data at end (grows the file to 192KB)
+            f.seek(SeekFrom::Start(131072)).unwrap();
+
+            let end_data = vec![2u8; 65536];
+            f.write_all(&end_data).unwrap();
+
+            // Explicitly punch the hole in the middle region (64KB to 128KB)
+            f.drill_hole(65536, 131072).unwrap();
+        }
+
+        // Create symlink (windows and unix) and hardlink (Unix only)
+        let symlink_path = src_dir.path.join("link.txt");
+        #[cfg(unix)]
+        let hardlink_path = src_dir.path.join("hardlink.txt");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("file1.txt", &symlink_path).unwrap();
+            fs::hard_link(&file1_path, &hardlink_path).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file("file1.txt", &symlink_path).unwrap();
+        }
+
+        // Get original modified time of file1
+        let meta_orig1 = fs::metadata(&file1_path).unwrap();
+        let modified_orig1 = meta_orig1.modified().unwrap();
+
+        // Get original modified time of subdirectory
+        let meta_orig2 = fs::metadata(&sub_dir).unwrap();
+        let modified_orig2 = meta_orig2.modified().unwrap();
+
+        // Perform archiving using ArchiveRead
+        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut archive_bytes = Vec::new();
+        for i in 0..=128 {
+            let (chunk, last) = reader.read_chunk().unwrap();
+            archive_bytes.extend(&chunk);
+            if last {
+                break;
+            }
+            assert!(i < 128); // timeout not reached
+        }
+        
+        reader.join_threads().unwrap();
+
+        // Verify we got some archive bytes
+        assert!(!archive_bytes.is_empty());
+
+        // Delete the original files before extracting to verify recreation
+        fs::remove_dir_all(&src_dir.path).unwrap();
+        assert!(!src_dir.path.exists());
+
+        // Perform extraction using ArchiveWrite by feeding it in small chunks
+        let mut writer = ArchiveWrite::new();
+        for chunk in archive_bytes.chunks(100) {
+            writer.write_files(chunk).unwrap();
+        }
+        writer.write_others().unwrap();
+
+        // Verify structure is fully recreated
+        assert!(src_dir.path.exists());
+        assert!(file1_path.exists());
+        assert!(empty_file_path.exists());
+        assert!(sub_dir.exists());
+        assert!(file2_path.exists());
+        assert!(sparse_path.exists());
+
+        // Verify contents
+        assert_eq!(fs::read(&file1_path).unwrap(), content1);
+        assert_eq!(fs::read(&empty_file_path).unwrap(), b"");
+        assert_eq!(fs::read(&file2_path).unwrap(), content2);
+
+        // Verify sparse file content
+        {
+            let mut f = File::open(&sparse_path).unwrap();
+            let mut start_buf = vec![0; 65536];
+            f.read_exact(&mut start_buf).unwrap();
+            assert_eq!(start_buf, vec![1u8; 65536]);
+
+            f.seek(SeekFrom::Start(131072)).unwrap();
+            let mut end_buf = vec![0; 65536];
+            f.read_exact(&mut end_buf).unwrap();
+            assert_eq!(end_buf, vec![2u8; 65536]);
+
+            assert_eq!(fs::metadata(&sparse_path).unwrap().len(), 196608);
+
+            // Verify it is actually a sparse file (has 1 hole)
+            let segs = f.scan_chunks().unwrap();
+            assert_eq!(segs.holes().count(), 1);
+            let hole = segs.holes().next().unwrap();
+            assert_eq!(hole.start, 65536);
+            assert_eq!(hole.end, 131072);
+        }
+
+        // Verify modified time of file1 is restored (seconds precision)
+        let meta_restored1 = fs::metadata(&file1_path).unwrap();
+        let modified_restored1 = meta_restored1.modified().unwrap();
+        assert_eq!(
+            modified_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        // Verify modified time of subdir is restored (seconds precision)
+        let meta_restored2 = fs::metadata(&sub_dir).unwrap();
+        let modified_restored2 = meta_restored2.modified().unwrap();
+        assert_eq!(
+            modified_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        // Verify symlink
+        assert!(symlink_path.exists());
+        let symlink_metadata = fs::symlink_metadata(&symlink_path).unwrap();
+        assert!(symlink_metadata.file_type().is_symlink());
+        let target = fs::read_link(&symlink_path).unwrap();
+        assert_eq!(target, Path::new("file1.txt"));
+        
+        // Verify hardlink (Unix only)
+        #[cfg(unix)]
+        {
+            assert!(hardlink_path.exists());
+            use std::os::unix::fs::MetadataExt;
+            let meta_f1 = fs::metadata(&file1_path).unwrap();
+            let meta_hl = fs::metadata(&hardlink_path).unwrap();
+            assert_eq!(meta_f1.ino(), meta_hl.ino());
+        }
+    }
+
+   #[test]
+    fn test_archive_sparse_files() {
+        let src_dir = TestDir::new("test_archive_sparse");
+
+        // hole only
+        let hole_filepath = src_dir.path.join("hole.bin");
+        let mut hole_file = File::create(&hole_filepath).unwrap();
+        let hole_filesize = 131072;
+        #[cfg(windows)]
+        ArchiveWrite::set_sparse_file_on_windows(&hole_file).unwrap();
+        hole_file.seek(SeekFrom::Start(hole_filesize - 1)).unwrap();
+        hole_file.write_all(&[0]).unwrap();
+        hole_file.drill_hole(0, hole_filesize).unwrap();
+        hole_file.sync_all().unwrap();
+
+        // hole-data
+        let hole_data_filepath = src_dir.path.join("hole_data.bin");
+        let mut hole_data_file = File::create(&hole_data_filepath).unwrap();
+        #[cfg(windows)]
+        ArchiveWrite::set_sparse_file_on_windows(&hole_data_file).unwrap();
+        hole_data_file.seek_relative(65536).unwrap();
+        hole_data_file.write_all(&[0x0Du8; 256]).unwrap();
+        hole_data_file.drill_hole(0, 65536).unwrap();
+        hole_data_file.sync_all().unwrap();
+
+        // data-hole
+        let data_hole_filepath = src_dir.path.join("data_hole.bin");
+        let mut data_hole_file = File::create(&data_hole_filepath).unwrap();
+        #[cfg(windows)]
+        ArchiveWrite::set_sparse_file_on_windows(&data_hole_file).unwrap();
+        data_hole_file.write_all(&vec![0xD0u8; 131072]).unwrap();
+        data_hole_file.seek_relative(131072 - 1).unwrap();
+        data_hole_file.write_all(&[0]).unwrap();
+        data_hole_file.drill_hole(131072, 131072 + 131072).unwrap();
+        data_hole_file.sync_all().unwrap();
+
+        // hole-data-hole
+        let hdh_filepath = src_dir.path.join("hole_data_hole.bin");
+        let mut hdh_file = File::create(&hdh_filepath).unwrap();
+        #[cfg(windows)]
+        ArchiveWrite::set_sparse_file_on_windows(&hdh_file).unwrap();
+        hdh_file.seek_relative(CHUNK_SIZE as i64).unwrap();
+        hdh_file.write_all(&vec![3; CHUNK_SIZE]).unwrap();
+        hdh_file.seek_relative(CHUNK_SIZE as i64 - 1).unwrap();
+        hdh_file.write_all(&[0]).unwrap();
+        hdh_file.drill_hole(0, CHUNK_SIZE as u64).unwrap();
+        hdh_file.drill_hole(2 * CHUNK_SIZE as u64, 3 * CHUNK_SIZE as u64).unwrap();
+        hdh_file.sync_all().unwrap();
+
+
+        // Perform archiving using ArchiveRead
+        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut archive_bytes = Vec::new();
+        for i in 0..=128 {
+            let (chunk, last_chunk) = reader.read_chunk().unwrap();
+            archive_bytes.extend(&chunk);
+            if last_chunk { break; }
+            assert!(i < 128); // timeout not reached
+        }
+        reader.join_threads().unwrap();
+
+        // Verify we got some archive bytes
+        assert!(!archive_bytes.is_empty());
+
+        // Delete the original files before extracting to verify recreation
+        fs::remove_dir_all(&src_dir.path).unwrap();
+        assert!(!src_dir.path.exists());
+
+
+        // Perform extraction using ArchiveWrite
+        let mut writer = ArchiveWrite::new();
+        for chunk in archive_bytes.chunks(CHUNK_SIZE) {
+            writer.write_files(chunk).unwrap();
+        }
+        writer.write_others().unwrap();
+
+        // Verify structure is fully recreated
+        assert!(src_dir.path.exists());
+        assert!(hole_filepath.exists());
+        assert!(hole_data_filepath.exists());
+        assert!(data_hole_filepath.exists());
+
+
+        // Verify hole-only file
+        let mut hole_file = File::open(&hole_filepath).unwrap();
+        let segs = hole_file.scan_chunks().unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs.holes().count(), 1);
+        assert_eq!(segs.data().count(), 0);
+        let hole = segs.first().unwrap();
+        assert_eq!(hole.segment_type, SegmentType::Hole);
+        assert_eq!(hole.range.start, 0);
+        assert_eq!(hole.range.end, hole_filesize);
+
+        // Verify hole-data file
+        let mut hole_data_file = File::open(&hole_data_filepath).unwrap();
+        let segs = hole_data_file.scan_chunks().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs.holes().count(), 1);
+        assert_eq!(segs.data().count(), 1);
+        let hole = segs.first().unwrap();   // check hole-segment
+        assert_eq!(hole.segment_type, SegmentType::Hole);
+        assert_eq!(hole.range.start, 0);
+        assert_eq!(hole.range.end, 65536);
+        let data = segs.last().unwrap();    // check data-segment
+        assert_eq!(data.segment_type, SegmentType::Data);
+        assert_eq!(data.range.start, 65536);
+        assert_eq!(data.range.end, 65536 + 256);
+        hole_data_file.rewind().unwrap();             // check file contents
+        let mut buf = vec![];
+        let file_size = hole_data_file.read_to_end(&mut buf).unwrap();
+        assert_eq!(file_size, 65536 + 256);
+        assert_eq!(buf[..65536], vec![0; 65536]);
+        assert_eq!(buf[65536..], vec![0x0Du8; 256]);
+        
+        // Verify data-hole file
+        let mut data_hole_file = File::open(&data_hole_filepath).unwrap();
+        let segs = data_hole_file.scan_chunks().unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs.holes().count(), 1);
+        assert_eq!(segs.data().count(), 1);
+        let data = segs.first().unwrap();   // check data-segment
+        assert_eq!(data.segment_type, SegmentType::Data);
+        assert_eq!(data.range.start, 0);
+        assert_eq!(data.range.end, 131072); 
+        let hole = segs.last().unwrap();    // check hole-segment
+        assert_eq!(hole.segment_type, SegmentType::Hole);
+        assert_eq!(hole.range.start, 131072);
+        assert_eq!(hole.range.end, 131072 + 131072);
+        data_hole_file.rewind().unwrap();             // check file contents
+        let mut buf = vec![];
+        let file_size = data_hole_file.read_to_end(&mut buf).unwrap();
+        assert_eq!(file_size, 131072 + 131072);
+        assert_eq!(buf[..131072], vec![0xD0u8; 131072]);
+        assert_eq!(buf[131072..], vec![0; 131072]);
+
+        // Verify hole-data-hole file
+        let mut hdh_file = File::open(&hdh_filepath).unwrap();
+        let segs = hdh_file.scan_chunks().unwrap();
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs.holes().count(), 2);
+        assert_eq!(segs.data().count(), 1);
+        let hole = segs.first().unwrap();   // check hole-segment
+        assert_eq!(hole.segment_type, SegmentType::Hole);
+        assert_eq!(hole.range.start, 0);
+        assert_eq!(hole.range.end, CHUNK_SIZE as u64);
+        let data = segs.get(1).unwrap(); // check data-segment
+        assert_eq!(data.segment_type, SegmentType::Data);
+        assert_eq!(data.range.start, CHUNK_SIZE as u64);
+        assert_eq!(data.range.end, 2 * CHUNK_SIZE as u64); 
+        let hole = segs.last().unwrap();    // check hole-segment
+        assert_eq!(hole.segment_type, SegmentType::Hole);
+        assert_eq!(hole.range.start, 2 * CHUNK_SIZE as u64);
+        assert_eq!(hole.range.end, 3 * CHUNK_SIZE as u64);
+        hdh_file.rewind().unwrap();                   // check file contents
+        let mut buf = vec![];
+        let file_size = hdh_file.read_to_end(&mut buf).unwrap();
+        assert_eq!(file_size, 3 * CHUNK_SIZE);
+        assert_eq!(buf[..CHUNK_SIZE], vec![0; CHUNK_SIZE]);
+        assert_eq!(buf[CHUNK_SIZE..2 * CHUNK_SIZE], vec![3; CHUNK_SIZE]);
+        assert_eq!(buf[2 * CHUNK_SIZE..], vec![0; CHUNK_SIZE]);
+    }
+
+
+    #[test]
+    fn test_archive_nonexistent_dir() {
+        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"));
+        let (chunk, last) = reader.read_chunk().unwrap();
+        assert!(last);
+        assert!(chunk.is_empty());
+        reader.join_threads().unwrap();
+    }
+
+    #[test]
+    fn test_archive_empty_dir() {
+        let src_dir = TestDir::new("test_archive_empty");
+        
+        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut archive_bytes = Vec::new();
+
+        let (chunk, last) = reader.read_chunk().unwrap();
+        archive_bytes.extend(&chunk);
+        assert!(last);
+
+        reader.join_threads().unwrap();
+
+        // Delete source
+        fs::remove_dir_all(&src_dir.path).unwrap();
+
+        // Extract
+        let mut writer = ArchiveWrite::new();
+        writer.write_files(&archive_bytes).unwrap();
+        writer.write_others().unwrap();
+
+        // Recreated directory should exist and be empty
+        assert!(src_dir.path.exists());
+        let count = fs::read_dir(&src_dir.path).unwrap().count();
+        assert_eq!(count, 0);
+    }
+}
+
