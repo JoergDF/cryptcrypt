@@ -806,7 +806,7 @@ mod tests {
         let _ = fs::remove_file("test_cc_split.bin.c03");
     }
 
-      #[test]
+    #[test]
     fn test_crypt_archive() {
         // Create directory with files that should be archived
         let dir_path = PathBuf::from("test_archive_toplevel");
@@ -843,6 +843,7 @@ mod tests {
         assert_eq!(fs::read(&file2).unwrap(), data2);
 
         let _ = fs::remove_dir_all(&dir_path);
+        let _ = fs::remove_file(&arch_path);
     }
 
     #[test]

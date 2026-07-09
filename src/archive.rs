@@ -5,11 +5,10 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use typed_path::Utf8WindowsPath;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 use crossbeam_channel::{Receiver, Select, TryRecvError, bounded};
 use num_cpus;
 use filetime;
-#[cfg(unix)]
 use std::collections::HashMap;
 use drill_press::{SegmentType, Segment, Segments, SparseFile};
 
@@ -66,35 +65,63 @@ impl ArchiveRead {
             let f_in_path = f_in_path.to_path_buf();
             let tx_paths = tx_paths.clone();
             thread_handles.push(thread::spawn(move || -> std::result::Result<(), String> {
+                
+                /// Helper function to get a file's metadata for detecting hardlinks (Unix version)
+                /// Files with hard links have a number-of-links greater 1. 
+                /// A hard link and the file it is pointing to have the same file id.
+                /// 
+                /// # Arguments
+                /// - `entry`: Directory entry which should be a file
+                /// 
+                /// # Returns
+                /// - `(num_links, file_id)`: (number of links, file id)
                 #[cfg(unix)]
-                let mut hard_link_files: HashMap<u64, PathBuf> = HashMap::new();
+                fn file_meta_for_hardlink(entry: &DirEntry) -> (u64, u128) {
+                    use std::os::unix::fs::MetadataExt;
+                    
+                    let mut num_links = 0;
+                    let mut file_id = 0;
+                    
+                    if let Ok(meta) = entry.metadata() {
+                        num_links = meta.nlink();
+                        file_id = meta.ino() as u128;
+                    } 
+                    
+                    (num_links, file_id)
+                }
+
+                /// Helper function to get a file's metadata for detecting hardlinks (Windows version)
+                #[cfg(windows)]
+                fn file_meta_for_hardlink(entry: &DirEntry) -> (u64, u128) {
+                    match ArchiveRead::file_meta_for_hardlink_on_windows(entry.path()) {
+                        Ok(values) => values,
+                        Err(e) => { 
+                            eprintln!("Could not get hard link information of file {} - Reason: {e}", entry.file_name().display());
+                            (0, 0)
+                        }
+                    }
+                }
+
+                let mut hard_link_files: HashMap<u128, PathBuf> = HashMap::new();
 
                 for entry in WalkDir::new(f_in_path) {
                     match entry {
                         Ok(entry) => {
                             // check if entry is a hard link
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::MetadataExt;
-                                use walkdir::DirEntryExt;
-                                
-                                let mut hard_link_target: Option<PathBuf> = None;
-                                if entry.file_type().is_file() 
-                                    && let Ok(meta) = entry.metadata() && meta.nlink() > 1 {
-                                        let file_id = entry.ino();
-                                        if let Some(hl_target) = hard_link_files.get(&file_id) {
-                                            // entry is hard link
-                                            hard_link_target = Some(hl_target.to_owned());
-                                        } else {
-                                            // entry is taken as original file path (i.e. target of hard link)
-                                            hard_link_files.insert(file_id, entry.clone().into_path());
-                                        }
+                            let mut hard_link_target: Option<PathBuf> = None;
+                            if entry.file_type().is_file() {
+                                let (num_links, file_id) = file_meta_for_hardlink(&entry);
+                                if num_links > 1 {
+                                    if let Some(hl_target) = hard_link_files.get(&file_id) {
+                                        // entry is hard link
+                                        hard_link_target = Some(hl_target.to_owned());
+                                    } else {
+                                        // entry is taken as original file path (i.e. target of hard link)
+                                        hard_link_files.insert(file_id, entry.clone().into_path());
+                                    }
                                 }
-                                let _ = tx_paths.send((entry, hard_link_target));
                             }
-                            #[cfg(windows)]
-                            let _ = tx_paths.send((entry, None));
-                            // windows: use number_of_links() and file_index() of std::os::windows::fs::MetadataExt, when supported by stable rust
+                            let _ = tx_paths.send((entry, hard_link_target));
                         }
                         Err(ref e) => { eprintln!("Skipped entry while walking directory tree - Reason: {e}"); }
                     }
@@ -200,6 +227,44 @@ impl ArchiveRead {
         Self { thread_handles, rx_out_receivers, channel_index: None, channel_finished: vec![false; num_workers], buf_out }
     }
 
+    /// Gets a file's metadata for detecting hardlinks (Windows version)
+    /// 
+    /// # Arguments
+    /// - `filepath` - path to file
+    /// 
+    /// # Returns
+    /// `Ok((num_links, file_id))` on success (number of links, file id)
+    /// `Èrr` if the system call fails.
+    #[cfg(windows)]
+    fn file_meta_for_hardlink_on_windows(filepath: &Path) -> std::io::Result<(u64, u128)> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+        use windows_sys::Win32::Foundation::HANDLE;
+
+        let mut num_links = 0;
+        let mut file_id = 0;
+
+        if let Ok(file) = File::open(filepath) {
+            let file_handle = file.as_raw_handle();
+            unsafe {
+                let mut info: BY_HANDLE_FILE_INFORMATION = mem::zeroed();
+                let result = GetFileInformationByHandle(
+                    file_handle as HANDLE,
+                    &mut info
+                );
+                if result == 0 {
+                    return Err(std::io::Error::last_os_error());
+                } else {
+                    num_links = info.nNumberOfLinks as u64;
+                    file_id = ((info.dwVolumeSerialNumber as u128) << 64) 
+                    | ((info.nFileIndexHigh as u128) << 32) | (info.nFileIndexLow as u128);
+                }
+            }
+        }
+        Ok((num_links, file_id))
+    }
+
     /// Appends the file path length and path string to the archive header buffer.
     ///
     /// # Arguments
@@ -231,7 +296,7 @@ impl ArchiveRead {
     /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
     /// - `Err` if metadata retrieval or OS-specific operations fail.
     #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &walkdir::DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
+    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
         // archive header initialized with place holder for header size
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
 
@@ -310,7 +375,7 @@ impl ArchiveRead {
             && let Ok(segs) = f_in.scan_chunks() {
                 sparse_segments = segs;            
                 
-                println!("arch: {}  {:?}", entry.path().display(), sparse_segments);
+                // println!("arch: {}  {:?}", entry.path().display(), sparse_segments);
 
                 // number of holes
                 let holes_count = sparse_segments.holes().count();
@@ -536,14 +601,15 @@ impl ArchiveWrite {
     #[cfg(windows)]
     fn set_sparse_file_on_windows(file: &File) -> std::io::Result<()> {
         use std::os::windows::io::AsRawHandle;
-        use winapi::um::ioapiset::DeviceIoControl;
-        use winapi::um::winioctl::FSCTL_SET_SPARSE;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        use windows_sys::Win32::Foundation::HANDLE;
 
         let handle = file.as_raw_handle();
         let mut bytes_returned = 0;
         unsafe {
             let result = DeviceIoControl(
-                handle as _,
+                handle as HANDLE,
                 FSCTL_SET_SPARSE,
                 std::ptr::null_mut(),
                 0,
@@ -654,11 +720,13 @@ impl ArchiveWrite {
                 if data_start != self.file_size {
                     self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
                 }
-                println!("unar: {:?} {:?}", entry_path.display(), self.sparse_segments);
+                // println!("unar: {:?} {:?}", entry_path.display(), self.sparse_segments);
 
                 // Windows requires to set sparse flag for a sparse file
                 #[cfg(windows)]
-                Self::set_sparse_file_on_windows(self.f_out.as_ref().unwrap())?;
+                if Self::set_sparse_file_on_windows(self.f_out.as_ref().unwrap()).is_err() {
+                    eprintln!("Could not set sparse option for file {}", entry_path.display());
+                }
             }
             
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
@@ -668,9 +736,6 @@ impl ArchiveWrite {
             // symlink's target path
             let target_path;
             (target_path, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
-
-            // remove symlink, if it already exists, otherwise it can't be created
-            let _ = fs::remove_file(&entry_path);
 
             // create symlink
             #[cfg(unix)]
@@ -787,9 +852,12 @@ impl WriteFiles for ArchiveWrite {
                     }
 
                     if self.file_size == 0 {
-                        // holes must not be set before the whole file was written
+                        // holes must not be set before the whole file was written;
+                        // on failure, the file should become non-sparse, do not break execution, just continue
                         for hole in self.sparse_segments.holes() {
-                            f_out.drill_hole(hole.start, hole.end)?;
+                            if f_out.drill_hole(hole.start, hole.end).is_err() {
+                                eprintln!("Could not set sparse region for file {}", self.file_path.display());
+                            }
                         }
 
                         self.data_segment_size = 0;
@@ -850,9 +918,6 @@ impl WriteFiles for ArchiveWrite {
         for (target_path, entry_path) in &self.pending_hardlinks {
             // create directory (of hard link), if it doesn't exists
             Self::create_parent_directory(entry_path)?;
-
-            // remove hard link, if it already exists, otherwise it can't be created
-            let _ = fs::remove_file(entry_path);
 
             fs::hard_link(target_path, entry_path)?;
         }
@@ -1006,19 +1071,20 @@ mod tests {
             f.drill_hole(65536, 131072).unwrap();
         }
 
-        // Create symlink (windows and unix) and hardlink (Unix only)
+        // Create symlink 
         let symlink_path = src_dir.path.join("link.txt");
-        #[cfg(unix)]
-        let hardlink_path = src_dir.path.join("hardlink.txt");
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("file1.txt", &symlink_path).unwrap();
-            fs::hard_link(&file1_path, &hardlink_path).unwrap();
         }
         #[cfg(windows)]
         {
             std::os::windows::fs::symlink_file("file1.txt", &symlink_path).unwrap();
         }
+
+        // Create hardlink
+        let hardlink_path = src_dir.path.join("hardlink.txt");
+        fs::hard_link(&file1_path, &hardlink_path).unwrap();
 
         // Get original modified time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
@@ -1114,7 +1180,7 @@ mod tests {
         let target = fs::read_link(&symlink_path).unwrap();
         assert_eq!(target, Path::new("file1.txt"));
         
-        // Verify hardlink (Unix only)
+        // Verify hardlink
         #[cfg(unix)]
         {
             assert!(hardlink_path.exists());
@@ -1122,6 +1188,16 @@ mod tests {
             let meta_f1 = fs::metadata(&file1_path).unwrap();
             let meta_hl = fs::metadata(&hardlink_path).unwrap();
             assert_eq!(meta_f1.ino(), meta_hl.ino());
+            assert_eq!(meta_f1.nlink(), meta_hl.nlink());
+        }
+        #[cfg(windows)]
+        {
+            assert!(hardlink_path.exists());
+            let (num_links_f1, file_id_f1) = ArchiveRead::file_meta_for_hardlink_on_windows(&file1_path).unwrap();
+            let (num_links_hl, file_id_hl) = ArchiveRead::file_meta_for_hardlink_on_windows(&hardlink_path).unwrap();
+            assert_eq!(file_id_f1, file_id_hl);
+            assert_eq!(num_links_f1, 2);
+            assert_eq!(num_links_hl, 2);
         }
     }
 
