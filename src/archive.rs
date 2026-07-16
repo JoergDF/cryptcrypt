@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use drill_press::{SegmentType, Segment, Segments, SparseFile};
 
 use crate::common_io::{ReadChunk, WriteFiles};
-use crate::{CHUNK_SIZE, Result};
+use crate::{CHUNK_SIZE, Result, ENCRYPTED_FILE_EXT, SPLIT_ENC_FILE_EXT};
 
 
 const TYPE_FILE:         u8 = 0x00;
@@ -51,10 +51,11 @@ impl ArchiveRead {
     ///
     /// # Arguments
     /// - `f_in_path`: The root path of the directory tree to archive.
+    /// - `exclude_path`: Path to be excluded from archive 
     ///
     /// # Returns
     /// - A new `ArchiveRead` instance.
-    pub fn new(f_in_path: &Path) -> Self {
+    pub fn new(f_in_path: &Path, exclude_path: &Path) -> Self {
         let num_workers = num_cpus::get();
         let mut thread_handles = Vec::with_capacity(num_workers + 1);
         let mut rx_out_receivers = Vec::with_capacity(num_workers);
@@ -63,12 +64,13 @@ impl ArchiveRead {
 
         {
             let f_in_path = f_in_path.to_path_buf();
+            let exclude_path = exclude_path.to_path_buf();
             let tx_paths = tx_paths.clone();
             thread_handles.push(thread::spawn(move || -> std::result::Result<(), String> {
                 
                 /// Helper function to get a file's metadata for detecting hardlinks (Unix version)
                 /// Files with hard links have a number-of-links greater 1. 
-                /// A hard link and the file it is pointing to have the same file id.
+                /// A hard link and the file it is pointing to have the same file id (inode).
                 /// 
                 /// # Arguments
                 /// - `entry`: Directory entry which should be a file
@@ -101,15 +103,19 @@ impl ArchiveRead {
                         }
                     }
                 }
-
+                
                 let mut hard_link_files: HashMap<u128, PathBuf> = HashMap::new();
 
                 for entry in WalkDir::new(f_in_path) {
                     match entry {
                         Ok(entry) => {
-                            // check if entry is a hard link
                             let mut hard_link_target: Option<PathBuf> = None;
                             if entry.file_type().is_file() {
+                                // exclude path from archiving (archive output files should not be used)
+                                if Self::exclude_file(entry.path(), &exclude_path) {
+                                    continue;
+                                }
+                                // check if entry is a hard link
                                 let (num_links, file_id) = file_meta_for_hardlink(&entry);
                                 if num_links > 1 {
                                     if let Some(hl_target) = hard_link_files.get(&file_id) {
@@ -225,6 +231,53 @@ impl ArchiveRead {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
 
         Self { thread_handles, rx_out_receivers, channel_index: None, channel_finished: vec![false; num_workers], buf_out }
+    }
+
+    /// Checks if a file entry path matches the exclude path (the target archive output file(s)).
+    ///
+    /// This prevents the archiver from reading and archiving its own output file(s)
+    /// (e.g. single `.cce` files or split `.cXX` archive volumes) when they are stored
+    /// within the directory being archived.
+    ///
+    /// # Arguments
+    /// - `entry_path`: The path of the file entry to check.
+    /// - `exclude_path`: The target archive output path to exclude.
+    ///
+    /// # Returns
+    /// - `true` if the entry path matches the target archive path and should be excluded.
+    /// - `false` otherwise.
+    fn exclude_file(entry_path: &Path, exclude_path: &Path) -> bool {
+        let Some(exclude_ext) = exclude_path.extension() else {
+            return false;
+        };
+        if exclude_ext == ENCRYPTED_FILE_EXT {
+            // single output file .cce
+
+            // exclude_path is an absolute path, entry.path() is a relative path
+            return exclude_path.ends_with(entry_path);
+
+        } else if exclude_ext == SPLIT_ENC_FILE_EXT {
+            // split file .c00, .c01, .c02, ...
+            
+            // entry.path() is relative, therefore make it absolute for following comparison
+            let Ok(entry_path) = entry_path.canonicalize() else {
+                return false;
+            };
+            if entry_path.parent() != exclude_path.parent() {
+                return false;
+            }
+            if entry_path.file_stem() != exclude_path.file_stem() {
+                return false;
+            }
+            if let Some(entry_ext) = entry_path.extension() && let Some(entry_ext) = entry_ext.to_str() {
+                return entry_ext.starts_with('c') && entry_ext[1..].chars().all(|c| c.is_ascii_digit());
+            }
+
+        } else {
+            panic!("Unknown file extension {}", exclude_ext.display());
+        }
+
+        false
     }
 
     /// Gets a file's metadata for detecting hardlinks (Windows version)
@@ -676,7 +729,7 @@ impl ArchiveWrite {
         // create type
         if file_type == TYPE_DIRECTORY {
             // create directory
-            // it could be an empty one therefore it would not be created by other entries
+            // it could be an empty directory therefore it would not be created by other entries
             fs::create_dir_all(&entry_path)?;
 
             // save timestamps for restoring them at the end
@@ -1095,7 +1148,7 @@ mod tests {
         let modified_orig2 = meta_orig2.modified().unwrap();
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last) = reader.read_chunk().unwrap();
@@ -1252,7 +1305,7 @@ mod tests {
 
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last_chunk) = reader.read_chunk().unwrap();
@@ -1364,10 +1417,9 @@ mod tests {
         assert_eq!(buf[2 * CHUNK_SIZE..], vec![0; CHUNK_SIZE]);
     }
 
-
     #[test]
     fn test_archive_nonexistent_dir() {
-        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"));
+        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"), Path::new(""));
         let (chunk, last) = reader.read_chunk().unwrap();
         assert!(last);
         assert!(chunk.is_empty());
@@ -1378,7 +1430,7 @@ mod tests {
     fn test_archive_empty_dir() {
         let src_dir = TestDir::new("test_archive_empty");
         
-        let mut reader = ArchiveRead::new(&src_dir.path);
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
         let mut archive_bytes = Vec::new();
 
         let (chunk, last) = reader.read_chunk().unwrap();
@@ -1399,6 +1451,70 @@ mod tests {
         assert!(src_dir.path.exists());
         let count = fs::read_dir(&src_dir.path).unwrap().count();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_exclude_file() {
+        // Case 1: No extension on exclude_path -> returns false
+        assert!(!ArchiveRead::exclude_file(Path::new("file.txt"), Path::new("no_ext")));
+
+        // Case 2: Unknown extension on exclude_path -> panics!
+        let result = std::panic::catch_unwind(|| {
+            ArchiveRead::exclude_file(Path::new("file.txt"), Path::new("file.txt"));
+        });
+        assert!(result.is_err());
+
+        // Case 3: ENCRYPTED_FILE_EXT ("cce")
+        let exclude_cce = Path::new("/path/to/my_archive.cce");
+        assert!(ArchiveRead::exclude_file(Path::new("my_archive.cce"), exclude_cce));
+        assert!(ArchiveRead::exclude_file(Path::new("to/my_archive.cce"), exclude_cce));
+        assert!(ArchiveRead::exclude_file(Path::new("path/to/my_archive.cce"), exclude_cce));
+        assert!(!ArchiveRead::exclude_file(Path::new("other.cce"), exclude_cce));
+
+        // Case 4: SPLIT_ENC_FILE_EXT ("c00")
+        let temp_dir = TestDir::new("test_exclude_file_split");
+        let base_dir = temp_dir.path.canonicalize().unwrap();
+
+        let exclude_c00 = base_dir.join("archive.c00");
+
+        // Non-existent entry path should fail canonicalize and return false
+        assert!(!ArchiveRead::exclude_file(Path::new("non_existent_archive.c00"), &exclude_c00));
+
+        // Create actual files to test successful canonicalization
+        let entry_c00 = base_dir.join("archive.c00");
+        File::create(&entry_c00).unwrap();
+        let entry_c01 = base_dir.join("archive.c01");
+        File::create(&entry_c01).unwrap();
+        let entry_c99 = base_dir.join("archive.c99");
+        File::create(&entry_c99).unwrap();
+        let entry_c100 = base_dir.join("archive.c100");
+        File::create(&entry_c100).unwrap();
+        let entry_txt = base_dir.join("archive.txt");
+        File::create(&entry_txt).unwrap();
+        let entry_other_stem = base_dir.join("other.c00");
+        File::create(&entry_other_stem).unwrap();
+
+        // Create a file in a different directory with same name/extension
+        let other_dir = base_dir.join("subdir");
+        fs::create_dir_all(&other_dir).unwrap();
+        let entry_diff_dir = other_dir.join("archive.c00");
+        File::create(&entry_diff_dir).unwrap();
+
+        // Assertions for c00 splits:
+        // matching splits
+        assert!(ArchiveRead::exclude_file(&entry_c00, &exclude_c00));
+        assert!(ArchiveRead::exclude_file(&entry_c01, &exclude_c00));
+        assert!(ArchiveRead::exclude_file(&entry_c99, &exclude_c00));
+        assert!(ArchiveRead::exclude_file(&entry_c100, &exclude_c00));
+
+        // relative matching path (canonicalize converts to absolute)
+        let relative_c00 = Path::new("test_exclude_file_split").join("archive.c00");
+        assert!(ArchiveRead::exclude_file(&relative_c00, &exclude_c00));
+
+        // non-matching extensions or stems
+        assert!(!ArchiveRead::exclude_file(&entry_txt, &exclude_c00));
+        assert!(!ArchiveRead::exclude_file(&entry_other_stem, &exclude_c00));
+        assert!(!ArchiveRead::exclude_file(&entry_diff_dir, &exclude_c00));
     }
 }
 

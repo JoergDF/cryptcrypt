@@ -2,6 +2,8 @@ use std::thread;
 use std::io::Read;
 use std::path::PathBuf;
 use std::collections::HashMap;
+use std::fs;
+use std::env;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use aes_gcm_siv::{aead::{Aead, KeyInit}, Aes256GcmSiv, Nonce};
@@ -311,12 +313,13 @@ impl Decryption {
     ///
     /// # Arguments
     /// - `filepath_in`: Path to encrypted input file (must end with `.cce`)
+    /// - `dirpath_out`: Option path to an output directory
     /// - `keyfilepath`: Optional path to an additional key file
     ///
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    pub fn decrypt(filepath_in: &PathBuf, keyfilepath: Option<&PathBuf>) -> Result<()> {
+    pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
         }
@@ -329,7 +332,7 @@ impl Decryption {
         } else {
             return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT} or .{SPLIT_ENC_FILE_EXT}").into())
         }
-
+       
         // set read parameters
         let mut read_input = Box:: new( ReadInput::new(
             filepath_in, 
@@ -354,12 +357,41 @@ impl Decryption {
             ).into());
         }
 
-        // get keys
+        let compress = (file_format & 0x01) != 0;
+        let archive  = (file_format & 0x02) != 0;
+        
+        let mut working_dir = &env::current_dir()?;
+        // output directory path is used
+        if let Some(dir_out) = dirpath_out {
+            if archive {
+                working_dir = dir_out;
+            } else {
+                let filename_out = filepath_out.file_name().unwrap();
+                filepath_out = dir_out.join(filename_out);
+            }
+        } 
+        
+        if archive {
+            println!("Archive file will be extracted to directory {}", working_dir.display());
+        } else {
+            println!("Output will be written to file {}", filepath_out.display());
+        }
+
+        // get password and keys
         let key = Self::hash_password(salt_pw, keyfilepath)?;
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
 
-        let compress = (file_format & 0x01) != 0;
-        let archive  = (file_format & 0x02) != 0;
+        // output directory actions: create new directory, change working directory for an archive
+        // create a new directory after password entry: 
+        // if password entry failed or user breaks execution on password entry, filesystem stays unchanged
+        if let Some(dir_out) = dirpath_out {
+            if !dir_out.exists() {
+                fs::create_dir_all(dir_out)?;
+            }
+            if archive {
+                env::set_current_dir(dir_out)?;
+            }
+        }
 
         let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
             Box::new( ArchiveWrite::new() )

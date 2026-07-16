@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{self, PathBuf};
 use clap::Parser;
 use std::process::ExitCode;
 use parse_size::Config;
@@ -14,6 +14,10 @@ use cryptcrypt::Result;
 /// With option -s the encrypted output is split into files with extensions .c00, .c01, .c02, ...
 /// If a file ending on .c00 is decrypted, the whole split series will be read.
 struct Args {
+    /// Output directory, it is created if it does not exist
+    #[arg(short, long)]
+    out_dir: Option<PathBuf>,
+
     /// Decrypt file (with extension '.cce' or for split series '.c00')
     #[arg(short, long, default_value_t = false)]
     decrypt: bool,
@@ -32,8 +36,8 @@ struct Args {
     split: Vec<u64>,
 
     /// File that should be encrypted or decrypted. 
-    /// If a directory is given, all its files and sub-directories are concatenated and encrypted.
-    file_or_dir: PathBuf,
+    /// If a directory is given, its contents is archived and encrypted.
+    file_or_directory: PathBuf,
 }
 
 /// Main entry point for the cryptcrypt application.
@@ -60,19 +64,14 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     let args = Args::parse();
 
-    let filepath = if args.file_or_dir.is_dir() {
-        // a directory should be used as is (relative or absolute), therefore do not canonicalize, which results in an absolute path
-        args.file_or_dir 
-    } else {
-        args.file_or_dir.canonicalize()?
-    };
-
-    let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
+    let filepath = args.file_or_directory.canonicalize()?;
+    let keyfilepath = args.keyfile.map(|keyf| keyf.canonicalize()).transpose()?;
+    let output_dir = args.out_dir.map(path::absolute).transpose()?;
 
     if args.decrypt {
-        Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
+        Decryption::decrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref())?;
     } else {
-        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?;
+        Encryption::encrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.compress, args.split)?;
     }
 
     Ok(())
