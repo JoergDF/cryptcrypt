@@ -52,10 +52,11 @@ impl ArchiveRead {
     /// # Arguments
     /// - `f_in_path`: The root path of the directory tree to archive.
     /// - `exclude_path`: Path to be excluded from archive 
+    /// - `strip_dir`: Path to be stripped from the start of each path in the archive to make paths relative
     ///
     /// # Returns
     /// - A new `ArchiveRead` instance.
-    pub fn new(f_in_path: &Path, exclude_path: &Path) -> Self {
+    pub fn new(f_in_path: &Path, exclude_path: &Path, strip_dir: &Path) -> Self {
         let num_workers = num_cpus::get();
         let mut thread_handles = Vec::with_capacity(num_workers + 1);
         let mut rx_out_receivers = Vec::with_capacity(num_workers);
@@ -142,6 +143,7 @@ impl ArchiveRead {
             let rx_paths = rx_paths.clone();
             let (tx_out, rx_out) = bounded(num_workers);
             rx_out_receivers.push(rx_out);
+            let strip_dir = strip_dir.to_path_buf();
 
             thread_handles.push(thread::spawn(move || -> std::result::Result<(), String> {
                 for (entry, hard_link_target) in rx_paths {
@@ -149,7 +151,7 @@ impl ArchiveRead {
                     let filepath_and_size;
                     let sparse_segments;
 
-                    match Self::build_archive_header(&entry, &hard_link_target) {
+                    match Self::build_archive_header(&entry, &hard_link_target, &strip_dir) {
                         Ok(values) => (archive_header, filepath_and_size, sparse_segments) = values,
                         Err(e) => {
                             eprintln!("Skipped entry on building archive header for {} - Reason: {e}", entry.path().display());
@@ -344,12 +346,13 @@ impl ArchiveRead {
     /// # Arguments
     /// - `entry`: The directory entry to construct the header for.
     /// - `hard_link_target`: Optional path pointing to the target if this is a hard link.
+    /// - `strip_dir`: Path to be stripped from the start of each path in the archive to make paths relative
     ///
     /// # Returns
     /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
     /// - `Err` if metadata retrieval or OS-specific operations fail.
     #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
+    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>, strip_dir: &PathBuf) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
         // archive header initialized with place holder for header size
         let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
 
@@ -392,14 +395,15 @@ impl ArchiveRead {
         let os_type = if cfg!(unix) { TYPE_UNIX } else { TYPE_WINDOWS };
         archive_header.push(os_type | entry_type);
 
-        // path length and path (including filename)
-        Self::add_path_to_header(entry.path(), &mut archive_header)?;
+        // path length and path (including filename) (converting to relative path)
+        let stripped_entry_path = entry.path().strip_prefix(strip_dir)?;
+        Self::add_path_to_header(stripped_entry_path, &mut archive_header)?;
 
         // println!("{}", entry.path().display());
 
         if entry_type == TYPE_HARDLINK {
             // target path of hard link
-            let target_path = hard_link_target.as_ref().unwrap();
+            let target_path = hard_link_target.as_ref().unwrap().strip_prefix(strip_dir)?;
             Self::add_path_to_header(target_path, &mut archive_header)?;
 
             // header size
@@ -575,18 +579,23 @@ pub struct ArchiveWrite {
     sparse_segments_index: usize,
     /// Size in bytes of the current sparse data segment.
     data_segment_size: u64,
+    /// Optional output directory.
+    dirpath_out: Option<PathBuf>,
 }
 
 impl ArchiveWrite {
     /// Initializes a new, empty `ArchiveWrite` instance.
     ///
+    /// # Arguments
+    /// - `dirpath_out`: Optional output directory
+    /// 
     /// # Returns
     /// - A default `ArchiveWrite` with allocated output buffer.
-    pub fn new() -> Self {
+    pub fn new(dirpath_out: Option<PathBuf>) -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
             file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![], sparse_segments: vec![],
-            sparse_segments_index: 0, data_segment_size: 0}
+            sparse_segments_index: 0, data_segment_size: 0, dirpath_out }
     }
 
     /// Ensures that the parent directory of the given path exists.
@@ -701,16 +710,22 @@ impl ArchiveWrite {
         // entry's path
         let entry_path_string;
         (entry_path_string, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
-        let entry_path = PathBuf::from(&entry_path_string);
+        let mut entry_path = PathBuf::from(&entry_path_string);
+        // add optional output directory to entry's path
+        if let Some(dir_out) = &self.dirpath_out {
+            entry_path = dir_out.join(entry_path);
+        }
 
         // println!("{}", entry_path.display());
 
         if file_type == TYPE_HARDLINK {
             // hard link's target path
-            let target_path;
-            (target_path, _) = Self::get_path_from_header(header, e, created_on_os_type)?;
-            
-            self.pending_hardlinks.push((PathBuf::from(target_path), entry_path));
+            let (target_path_string, _) = Self::get_path_from_header(header, e, created_on_os_type)?;
+            let mut target_path = PathBuf::from(target_path_string);
+            if let Some(dir_out) = &self.dirpath_out {
+                target_path = dir_out.join(target_path);
+            }
+            self.pending_hardlinks.push((target_path, entry_path));
             return Ok(());
         }
 
@@ -736,7 +751,7 @@ impl ArchiveWrite {
             self.dir_times.push((entry_path.clone(), time_accessed, time_modified));
 
         } else if file_type == TYPE_FILE {
-            // create directory (of file), if it doesn't exists
+            // create directory (of file), if it doesn't exist
             Self::create_parent_directory(&entry_path)?;
 
             // create file
@@ -783,7 +798,7 @@ impl ArchiveWrite {
             }
             
         } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
-            // create directory (of symlink), if it doesn't exists
+            // create directory (of symlink), if it doesn't exist
             Self::create_parent_directory(&entry_path)?;
 
             // symlink's target path
@@ -969,12 +984,10 @@ impl WriteFiles for ArchiveWrite {
     fn write_others(&self) -> Result<()> {
         // create hard links, if there are any
         for (target_path, entry_path) in &self.pending_hardlinks {
-            // create directory (of hard link), if it doesn't exists
+            // create directory (of hard link), if it doesn't exist
             Self::create_parent_directory(entry_path)?;
-
             fs::hard_link(target_path, entry_path)?;
         }
-
         // set timestamps of directories
         // need to be done after all elements have been created, as creation of an element
         // updates timestamp of its parent directory to now
@@ -1139,16 +1152,17 @@ mod tests {
         let hardlink_path = src_dir.path.join("hardlink.txt");
         fs::hard_link(&file1_path, &hardlink_path).unwrap();
 
-        // Get original modified time of file1
+        // Get original modified/accessed time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
         let modified_orig1 = meta_orig1.modified().unwrap();
+        let accessed_orig1 = meta_orig1.accessed().unwrap();
 
         // Get original modified time of subdirectory
         let meta_orig2 = fs::metadata(&sub_dir).unwrap();
         let modified_orig2 = meta_orig2.modified().unwrap();
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last) = reader.read_chunk().unwrap();
@@ -1169,7 +1183,7 @@ mod tests {
         assert!(!src_dir.path.exists());
 
         // Perform extraction using ArchiveWrite by feeding it in small chunks
-        let mut writer = ArchiveWrite::new();
+        let mut writer = ArchiveWrite::new(None);
         for chunk in archive_bytes.chunks(100) {
             writer.write_files(chunk).unwrap();
         }
@@ -1210,12 +1224,17 @@ mod tests {
             assert_eq!(hole.end, 131072);
         }
 
-        // Verify modified time of file1 is restored (seconds precision)
+        // Verify modified/accessed time of file1 is restored (seconds precision)
         let meta_restored1 = fs::metadata(&file1_path).unwrap();
         let modified_restored1 = meta_restored1.modified().unwrap();
         assert_eq!(
             modified_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+        let accessed_restored1 = meta_restored1.accessed().unwrap();
+        assert_eq!(
+            accessed_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            accessed_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
         );
 
         // Verify modified time of subdir is restored (seconds precision)
@@ -1305,7 +1324,7 @@ mod tests {
 
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last_chunk) = reader.read_chunk().unwrap();
@@ -1324,7 +1343,7 @@ mod tests {
 
 
         // Perform extraction using ArchiveWrite
-        let mut writer = ArchiveWrite::new();
+        let mut writer = ArchiveWrite::new(None);
         for chunk in archive_bytes.chunks(CHUNK_SIZE) {
             writer.write_files(chunk).unwrap();
         }
@@ -1419,7 +1438,7 @@ mod tests {
 
     #[test]
     fn test_archive_nonexistent_dir() {
-        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"), Path::new(""));
+        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"), Path::new(""), Path::new(""));
         let (chunk, last) = reader.read_chunk().unwrap();
         assert!(last);
         assert!(chunk.is_empty());
@@ -1430,7 +1449,7 @@ mod tests {
     fn test_archive_empty_dir() {
         let src_dir = TestDir::new("test_archive_empty");
         
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
         let mut archive_bytes = Vec::new();
 
         let (chunk, last) = reader.read_chunk().unwrap();
@@ -1443,7 +1462,7 @@ mod tests {
         fs::remove_dir_all(&src_dir.path).unwrap();
 
         // Extract
-        let mut writer = ArchiveWrite::new();
+        let mut writer = ArchiveWrite::new(None);
         writer.write_files(&archive_bytes).unwrap();
         writer.write_others().unwrap();
 

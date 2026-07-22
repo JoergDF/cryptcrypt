@@ -360,11 +360,11 @@ impl Decryption {
         let compress = (file_format & 0x01) != 0;
         let archive  = (file_format & 0x02) != 0;
         
-        let mut working_dir = &env::current_dir()?;
+        let mut output_dir = &env::current_dir()?;
         // output directory path is used
         if let Some(dir_out) = dirpath_out {
             if archive {
-                working_dir = dir_out;
+                output_dir = dir_out;
             } else {
                 let filename_out = filepath_out.file_name().unwrap();
                 filepath_out = dir_out.join(filename_out);
@@ -372,7 +372,7 @@ impl Decryption {
         } 
         
         if archive {
-            println!("Archive file will be extracted to directory {}", working_dir.display());
+            println!("Archive file will be extracted to directory {}", output_dir.display());
         } else {
             println!("Output will be written to file {}", filepath_out.display());
         }
@@ -381,20 +381,15 @@ impl Decryption {
         let key = Self::hash_password(salt_pw, keyfilepath)?;
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
 
-        // output directory actions: create new directory, change working directory for an archive
+        // output directory action:
         // create a new directory after password entry: 
         // if password entry failed or user breaks execution on password entry, filesystem stays unchanged
-        if let Some(dir_out) = dirpath_out {
-            if !dir_out.exists() {
-                fs::create_dir_all(dir_out)?;
-            }
-            if archive {
-                env::set_current_dir(dir_out)?;
-            }
+        if let Some(dir_out) = dirpath_out && !dir_out.exists() {
+            fs::create_dir_all(dir_out)?;
         }
 
         let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
-            Box::new( ArchiveWrite::new() )
+            Box::new( ArchiveWrite::new(dirpath_out.cloned()) )
         } else {
             // set write parameters and create output file
             Box::new( WriteOutput::new(filepath_out, vec![])? )

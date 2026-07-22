@@ -1,7 +1,6 @@
 use std::io::Read;
-use std::path::{self, PathBuf};
+use std::path::{Path, PathBuf};
 use std::{fs, thread};
-use std::env;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305};
 use rand::{Rng, SeedableRng};
@@ -346,7 +345,7 @@ impl Encryption {
     /// archiving). Constructs the final output file path by applying the correct
     /// extension depending on whether splitting is enabled, and redirects output
     /// to the target directory if specified. If archiving a directory, it returns
-    /// the target working directory that should be set during archiving to keep
+    /// the directory that should be stripped during archiving to keep
     /// paths relative.
     ///
     /// # Arguments
@@ -355,17 +354,18 @@ impl Encryption {
     /// - `no_split`: Boolean flag indicating if output splitting is disabled.
     ///
     /// # Returns
-    /// - `Ok((processed_path_in, filepath_out, build_archive, new_working_dir))` containing:
-    ///   - `processed_path_in`: The relative input path if archiving, or the original input path.
+    /// - `Ok((filepath_out, build_archive, strip_dir_in))` containing:
     ///   - `filepath_out`: The resolved absolute path of the output encrypted file.
     ///   - `build_archive`: Boolean indicating whether the input is a directory.
-    ///   - `new_working_dir`: Optional path to the directory that the process should change to before archiving.
+    ///   - `strip_dir_in`: Optional directory path that should be stripped from the start of the absolute archive path.
     /// - `Err` if absolute path resolution fails.
-    fn set_paths(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, no_split: bool) -> Result<(PathBuf, PathBuf, bool, Option<PathBuf>)> {
+    fn set_paths(filepath_in: &Path, dirpath_out: Option<&PathBuf>, no_split: bool) -> Result<(PathBuf, bool, Option<PathBuf>)> {
+        assert!(filepath_in.is_absolute());
+    
         let build_archive = filepath_in.is_dir();
 
-        let mut filepath_out = filepath_in.clone();
-        // if input path is the root or relative (e.g. "/", "."), so without directory name, add a name for the archive
+        let mut filepath_out = filepath_in.to_path_buf();
+        // if input path is the root (e.g. "/"), so without directory name, add a name for the archive
         if build_archive && filepath_in.file_name().is_none() {    
             filepath_out.push("archive");
         }
@@ -377,28 +377,21 @@ impl Encryption {
         // output directory path is used
         // build path, but create directory after password entry
         if let Some(dir_out) = dirpath_out {
+            assert!(dir_out.is_absolute());
             let filename_out = filepath_out.file_name().unwrap();
             filepath_out = dir_out.join(filename_out);
         }
-        filepath_out = path::absolute(filepath_out)?;
 
-        let mut new_working_dir = None;
-        let processed_path_in = if build_archive {
-            // change directory to parent directory
-            if let Some(dir_path) = filepath_in.file_name() {
-                if let Some(parent_path) = filepath_in.parent() && parent_path != "" {
-                    new_working_dir = Some(parent_path.to_path_buf());
-                }
-                PathBuf::from(dir_path)
+        let mut strip_dir_in = None;
+        if build_archive {
+            if let Some(parent_path) = filepath_in.parent() {
+                strip_dir_in = Some(parent_path.to_path_buf());
             } else {
-                new_working_dir = Some(filepath_in.to_path_buf());
-                PathBuf::from(".")
+                strip_dir_in = Some(filepath_in.to_path_buf());
             }
-        } else {
-            filepath_in.to_path_buf()
-        };
+        }
 
-        Ok((processed_path_in, filepath_out, build_archive, new_working_dir))
+        Ok((filepath_out, build_archive, strip_dir_in))
     }
 
     /// Encrypts a file or a directory using dual-layer encryption (ChaCha20 + AES-256-GCM-SIV) 
@@ -421,13 +414,10 @@ impl Encryption {
     /// - `Err` if file operations, password handling, or encryption fails
     pub fn encrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>) -> Result<()> {
         
-        let (processed_path_in, filepath_out, build_archive, new_working_dir) = Self::set_paths(filepath_in, dirpath_out, split.is_empty())?;
-        if build_archive && let Some(work_dir) = new_working_dir {
-            env::set_current_dir(work_dir)?;
-        }
+        let (filepath_out, build_archive, strip_dir) = Self::set_paths(filepath_in, dirpath_out, split.is_empty())?;
 
         println!("Output will be written to {}", filepath_out.display());
-
+        
         // ask for password, before there can be error messages of archive 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
@@ -440,9 +430,9 @@ impl Encryption {
         }
 
         let read_input: Box<dyn ReadChunk> = if build_archive {
-            Box::new( ArchiveRead::new(&processed_path_in, &filepath_out) ) 
+            Box::new( ArchiveRead::new(filepath_in, &filepath_out, &strip_dir.unwrap()) ) 
         } else {
-            Box::new( ReadInput::new(&processed_path_in, CHUNK_SIZE, 0)? )
+            Box::new( ReadInput::new(filepath_in, CHUNK_SIZE, 0)? )
         };
 
         // file header
@@ -468,7 +458,7 @@ impl Encryption {
         write_output.write_files(&header)?;
 
         CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
-
+        
         Ok(())
     }
 }
@@ -482,6 +472,7 @@ impl Encryption {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path;
     use crate::decryption::Decryption;
 
     #[test]
@@ -741,7 +732,7 @@ mod tests {
     #[test]
     fn test_crypt() {
         // create file with random data for encryption
-        let filepath_in = PathBuf::from("test_cc.bin");
+        let filepath_in = path::absolute(PathBuf::from("test_cc.bin")).unwrap();
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
 
@@ -773,16 +764,28 @@ mod tests {
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
+        // with output directory
+        let out_enc_dir = path::absolute(PathBuf::from("test_cc_enc_dir")).unwrap();
+        Encryption::encrypt(&filepath_in, Some(&out_enc_dir), None, false, vec![]).unwrap();
+        assert!(&out_enc_dir.join(&filepath_out).exists());
+        let out_dec_dir = path::absolute(PathBuf::from("test_cc_dec_dir")).unwrap();
+        Decryption::decrypt(&out_enc_dir.join(&filepath_out), Some(&out_dec_dir), None).unwrap();
+        assert!(&out_dec_dir.join(&filepath_in).exists());
+        let decrypt_data = fs::read(out_dec_dir.join(&filepath_in)).unwrap();
+        assert_eq!(data, decrypt_data[..]);
+
         // cleanup
         let _ = fs::remove_file(&filepath_in);
         let _ = fs::remove_file(&filepath_out);
         let _ = fs::remove_file(&filepath_kf);
+        let _ = fs::remove_dir_all(&out_enc_dir);
+        let _ = fs::remove_dir_all(&out_dec_dir);
     }
 
     #[test]
     fn test_crypt_with_keyfile() {
         // create file with random data for encryption
-        let filepath_in = PathBuf::from("test_cc_kf.bin");
+        let filepath_in = path::absolute(PathBuf::from("test_cc_kf.bin")).unwrap();
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
         let filepath_kf = PathBuf::from("test_key.bin");
@@ -811,7 +814,7 @@ mod tests {
         assert!(Decryption::decrypt(&filepath_out, None, Some(&PathBuf::from("test_miss"))).is_err());
 
         // input file does not exist
-        assert!(Encryption::encrypt(&PathBuf::from("test_miss"), None, None, false, vec![]).is_err());
+        assert!(Encryption::encrypt(&path::absolute(PathBuf::from("test_miss")).unwrap(), None, None, false, vec![]).is_err());
         assert!(Decryption::decrypt(&PathBuf::from("test_miss.cce"), None, None).is_err());
         assert!(!fs::exists("test_miss").unwrap());
         assert!(!fs::exists("test_miss.cce").unwrap());
@@ -831,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_crypt_split() {
-        let filepath_in = PathBuf::from("test_cc_split.bin");
+        let filepath_in = path::absolute(PathBuf::from("test_cc_split.bin")).unwrap();
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
 
@@ -880,7 +883,8 @@ mod tests {
     #[test]
     fn test_crypt_archive() {
         // Create directory with files that should be archived
-        let dir_path = PathBuf::from("test_archive_toplevel");
+        let dir_name = "test_cc_archive";
+        let dir_path = path::absolute(PathBuf::from(dir_name)).unwrap();
         let _ = fs::remove_dir_all(&dir_path);
         fs::create_dir_all(&dir_path).unwrap();
         
@@ -893,6 +897,25 @@ mod tests {
         let mut data2 = vec![0; CHUNK_SIZE];
         rand::rng().fill_bytes(&mut data2);
         fs::write(&file2, &data2).unwrap();
+
+        // sub-directory for links
+        let sub_dir = dir_path.join("links");
+        fs::create_dir(&sub_dir).unwrap();
+
+        // create symlink
+        let symlink1 = sub_dir.join("symlink1.bin");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&file1, &symlink1).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(&file1, &symlink1).unwrap();
+        }
+
+        // create hardlink
+        let hardlink2 = sub_dir.join("hardlink2.bin");
+        fs::hard_link(&file2, &hardlink2).unwrap();
 
         // Build archive of directory and encrypt it
         Encryption::encrypt(&dir_path, None, None, false, vec![]).unwrap();
@@ -909,21 +932,56 @@ mod tests {
         assert!(dir_path.exists());
         assert!(file1.exists());
         assert!(file2.exists());
+        assert!(&symlink1.exists());
+        assert!(&hardlink2.exists());
 
         // Verify contents
         assert_eq!(fs::read(&file1).unwrap(), data1);
         assert_eq!(fs::read(&file2).unwrap(), data2);
+        assert_eq!(fs::read(&symlink1).unwrap(), data1);
+        assert_eq!(fs::read(&hardlink2).unwrap(), data2);
 
-        let _ = fs::remove_dir_all(&dir_path);
+
+        // With output directory, with split, check exclusion of output archive files 
+        let out_enc_dir = &dir_path; 
+        Encryption::encrypt(&dir_path, Some(&out_enc_dir), None, false, vec![1000,10000]).unwrap();
+        assert!(out_enc_dir.join(dir_name).with_extension(SPLIT_ENC_FILE_EXT).exists());
+
+        let out_dec_dir = path::absolute(PathBuf::from("test_cc_dec_dir")).unwrap();
+        let _ = fs::remove_dir_all(&out_dec_dir);
+        Decryption::decrypt(&out_enc_dir.join(dir_name).with_extension(SPLIT_ENC_FILE_EXT), Some(&out_dec_dir), None).unwrap();
+        
+        // Verify structure is fully recreated
+        assert!(out_dec_dir.join(dir_name).exists());
+        assert!(out_dec_dir.join(&file1).exists());
+        assert!(out_dec_dir.join(&file2).exists());
+        assert!(out_dec_dir.join(&symlink1).exists());
+        assert!(out_dec_dir.join(&hardlink2).exists());
+
+        // Verify contents
+        assert_eq!(fs::read(out_dec_dir.join(&file1)).unwrap(), data1);
+        assert_eq!(fs::read(out_dec_dir.join(&file2)).unwrap(), data2);
+        assert_eq!(fs::read(out_dec_dir.join(&symlink1)).unwrap(), data1);
+        assert_eq!(fs::read(out_dec_dir.join(&hardlink2)).unwrap(), data2);
+
+        // Verify exclude of archive files
+        assert!(!out_dec_dir.join(dir_name).with_added_extension(SPLIT_ENC_FILE_EXT).exists());
+        assert!(!out_dec_dir.join(dir_name).with_added_extension("c01").exists());
+        assert!(!out_dec_dir.join(dir_name).with_added_extension("c02").exists());
+
         let _ = fs::remove_file(&arch_path);
+        let _ = fs::remove_dir_all(&dir_path);
+        let _ = fs::remove_dir_all(&out_enc_dir);
+        let _ = fs::remove_dir_all(&out_dec_dir);
     }
 
     #[test]
     fn test_set_paths() {
-        // Create temporary test files and directories
-        let test_dir = PathBuf::from("test_set_paths_dir");
+        // Create test files and directories
+        let mut test_dir = PathBuf::from("test_set_paths_dir");
         let _ = fs::remove_dir_all(&test_dir);
         fs::create_dir_all(&test_dir).unwrap();
+        test_dir = test_dir.canonicalize().unwrap();
 
         let test_file = test_dir.join("test_file.txt");
         fs::write(&test_file, b"test data").unwrap();
@@ -936,10 +994,9 @@ mod tests {
 
         // 1. File input, no output dir, no split
         {
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&test_file, None, true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, None, true).unwrap();
             assert!(!archive);
-            assert_eq!(work_dir, None);
-            assert_eq!(processed_in, test_file);
+            assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
             expected.add_extension(ENCRYPTED_FILE_EXT);
             assert_eq!(file_out, path::absolute(expected).unwrap());
@@ -947,10 +1004,9 @@ mod tests {
 
         // 2. File input, no output dir, with split
         {
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&test_file, None, false).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, None, false).unwrap();
             assert!(!archive);
-            assert_eq!(work_dir, None);
-            assert_eq!(processed_in, test_file);
+            assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
             expected.add_extension(SPLIT_ENC_FILE_EXT);
             assert_eq!(file_out, path::absolute(expected).unwrap());
@@ -958,10 +1014,9 @@ mod tests {
 
         // 3. File input, with output dir, no split
         {
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&test_file, Some(&output_dir), true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, Some(&output_dir), true).unwrap();
             assert!(!archive);
-            assert_eq!(work_dir, None);
-            assert_eq!(processed_in, test_file);
+            assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
             expected.add_extension(ENCRYPTED_FILE_EXT);
             let expected_out = path::absolute(output_dir.join(expected.file_name().unwrap())).unwrap();
@@ -970,10 +1025,9 @@ mod tests {
 
         // 4. Directory input (sub_dir), no output dir, no split
         {
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&sub_dir, None, true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, None, true).unwrap();
             assert!(archive);
-            assert_eq!(work_dir, Some(test_dir.clone()));
-            assert_eq!(processed_in, PathBuf::from("sub_dir"));
+            assert_eq!(strip_dir, Some(test_dir.clone()));
             let mut expected = sub_dir.clone();
             expected.add_extension(ENCRYPTED_FILE_EXT);
             assert_eq!(file_out, path::absolute(expected).unwrap());
@@ -981,27 +1035,29 @@ mod tests {
 
         // 5. Directory input (sub_dir), with output dir, with split
         {
-            let relative_sub_dir = PathBuf::from("test_set_paths_dir/sub_dir");
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&relative_sub_dir, Some(&output_dir), false).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, Some(&output_dir), false).unwrap();
             assert!(archive);
-            assert_eq!(work_dir, Some(test_dir.clone()));
-            assert_eq!(processed_in, PathBuf::from("sub_dir"));
+            assert_eq!(strip_dir, Some(test_dir.clone()));
             let mut expected = PathBuf::from("sub_dir");
             expected.add_extension(SPLIT_ENC_FILE_EXT);
             let expected_out = path::absolute(output_dir.join(expected.file_name().unwrap())).unwrap();
             assert_eq!(file_out, expected_out);
         }
 
-        // 6. Directory input without parent/file_name (e.g. ".")
+        // 6. Directory input without parent/file_name (e.g. "/")
         {
-            let dot_path = PathBuf::from(".");
-            let (processed_in, file_out, archive, work_dir) = Encryption::set_paths(&dot_path, None, true).unwrap();
+            let root_path = 
+            if cfg!(unix) {
+                PathBuf::from("/")
+            } else {
+                PathBuf::from("c:/")
+            };
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&root_path, None, true).unwrap();
             assert!(archive);
-            assert_eq!(work_dir, Some(PathBuf::from(".")));
-            assert_eq!(processed_in, PathBuf::from("."));
-            let mut expected = PathBuf::from("archive");
+            assert_eq!(strip_dir, Some(root_path.clone()));
+            let mut expected = root_path.join("archive");
             expected.add_extension(ENCRYPTED_FILE_EXT);
-            assert_eq!(file_out, path::absolute(expected).unwrap());
+            assert_eq!(file_out, expected);
         }
 
         // Clean up
