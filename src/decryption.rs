@@ -319,7 +319,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>) -> Result<()> {
+    pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, verbose: bool) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
         }
@@ -359,7 +359,7 @@ impl Decryption {
 
         let compress = (file_format & 0x01) != 0;
         let archive  = (file_format & 0x02) != 0;
-        
+
         let mut output_dir = &env::current_dir()?;
         // output directory path is used
         if let Some(dir_out) = dirpath_out {
@@ -388,8 +388,16 @@ impl Decryption {
             fs::create_dir_all(dir_out)?;
         }
 
+        if verbose {
+            println!("--------------------------");
+            println!("File format version: {}", file_format_version);
+            println!("Compressed:          {}", compress);
+            println!("Archived:            {}", archive);
+            println!("--------------------------");
+        }
+
         let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
-            Box::new( ArchiveWrite::new(dirpath_out.cloned()) )
+            Box::new( ArchiveWrite::new(dirpath_out.cloned(), verbose) )
         } else {
             // set write parameters and create output file
             Box::new( WriteOutput::new(filepath_out, vec![])? )

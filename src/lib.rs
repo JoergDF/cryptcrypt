@@ -11,7 +11,7 @@ pub mod decryption;
 pub mod archive;
 
 
-pub const FILE_FORMAT_VERSION: u8   = 4;
+pub const FILE_FORMAT_VERSION: u8   = 5;
 pub const ENCRYPTED_FILE_EXT: &str  = "cce";
 pub const SPLIT_ENC_FILE_EXT: &str  = "c00";
 pub const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes

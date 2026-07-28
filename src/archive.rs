@@ -56,7 +56,7 @@ impl ArchiveRead {
     ///
     /// # Returns
     /// - A new `ArchiveRead` instance.
-    pub fn new(f_in_path: &Path, exclude_path: &Path, strip_dir: &Path) -> Self {
+    pub fn new(f_in_path: &Path, exclude_path: &Path, strip_dir: &Path, verbose: bool) -> Self {
         let num_workers = num_cpus::get();
         let mut thread_handles = Vec::with_capacity(num_workers + 1);
         let mut rx_out_receivers = Vec::with_capacity(num_workers);
@@ -151,7 +151,8 @@ impl ArchiveRead {
                     let filepath_and_size;
                     let sparse_segments;
 
-                    match Self::build_archive_header(&entry, &hard_link_target, &strip_dir) {
+                    // archive header
+                    match Self::build_archive_header(&entry, &hard_link_target, &strip_dir, verbose) {
                         Ok(values) => (archive_header, filepath_and_size, sparse_segments) = values,
                         Err(e) => {
                             eprintln!("Skipped entry on building archive header for {} - Reason: {e}", entry.path().display());
@@ -159,6 +160,7 @@ impl ArchiveRead {
                         }
                     }
 
+                    // read data from file and send it to chunk reader
                     if let Some((filepath, mut file_size)) = filepath_and_size {
                         match File::open(&filepath) {
                             Ok(mut f_in) => {
@@ -352,9 +354,10 @@ impl ArchiveRead {
     /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
     /// - `Err` if metadata retrieval or OS-specific operations fail.
     #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>, strip_dir: &PathBuf) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
+    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>, strip_dir: &PathBuf, verbose: bool) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
         // archive header initialized with place holder for header size
-        let mut archive_header = vec![0u8; ARCHIVE_HEADER_LENGTH_SIZE];
+        let mut archive_header =  Vec::with_capacity(1024);
+        archive_header.extend([0u8; ARCHIVE_HEADER_LENGTH_SIZE]);
 
         /// Computes and sets the final header size at the beginning of the header buffer.
         /// It is called after all other header fields have been added to the header buffer.
@@ -399,7 +402,9 @@ impl ArchiveRead {
         let stripped_entry_path = entry.path().strip_prefix(strip_dir)?;
         Self::add_path_to_header(stripped_entry_path, &mut archive_header)?;
 
-        // println!("{}", entry.path().display());
+        if verbose {
+            println!("{}", stripped_entry_path.display());
+        }
 
         if entry_type == TYPE_HARDLINK {
             // target path of hard link
@@ -412,18 +417,21 @@ impl ArchiveRead {
             return Ok((archive_header, None, vec![]));
         }
 
+        // metadata of entry
+        let meta_entry = entry.metadata()?;
+
         // last access time 
-        let time_accessed = entry.metadata()?.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
+        let time_accessed = meta_entry.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
         archive_header.extend(time_accessed.to_le_bytes());
         // last modification time
-        let time_modified = entry.metadata()?.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+        let time_modified = meta_entry.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
         archive_header.extend(time_modified.to_le_bytes());
 
         let mut file_size = 0;
         let mut sparse_segments = vec![];
         if entry_type == TYPE_FILE {
             // file size
-            file_size = entry.metadata()?.len();
+            file_size = meta_entry.len();
             archive_header.extend(file_size.to_le_bytes());
 
             // sparse file
@@ -459,7 +467,7 @@ impl ArchiveRead {
 
             let mut perm: u16 = 0;
             if entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY {
-                let permission_mode = entry.metadata()?.permissions().mode();
+                let permission_mode = meta_entry.permissions().mode();
                 // use 12 least significant bits
                 perm = (permission_mode & 0x0FFF) as u16;
             }
@@ -581,6 +589,8 @@ pub struct ArchiveWrite {
     data_segment_size: u64,
     /// Optional output directory.
     dirpath_out: Option<PathBuf>,
+    /// Enable verbose prints.
+    verbose: bool,
 }
 
 impl ArchiveWrite {
@@ -591,11 +601,11 @@ impl ArchiveWrite {
     /// 
     /// # Returns
     /// - A default `ArchiveWrite` with allocated output buffer.
-    pub fn new(dirpath_out: Option<PathBuf>) -> Self {
+    pub fn new(dirpath_out: Option<PathBuf>, verbose: bool) -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
             file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![], sparse_segments: vec![],
-            sparse_segments_index: 0, data_segment_size: 0, dirpath_out }
+            sparse_segments_index: 0, data_segment_size: 0, dirpath_out, verbose }
     }
 
     /// Ensures that the parent directory of the given path exists.
@@ -716,7 +726,9 @@ impl ArchiveWrite {
             entry_path = dir_out.join(entry_path);
         }
 
-        // println!("{}", entry_path.display());
+        if self.verbose {
+            println!("{}", entry_path.display());
+        }
 
         if file_type == TYPE_HARDLINK {
             // hard link's target path
@@ -788,7 +800,6 @@ impl ArchiveWrite {
                 if data_start != self.file_size {
                     self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
                 }
-                // println!("unar: {:?} {:?}", entry_path.display(), self.sparse_segments);
 
                 // Windows requires to set sparse flag for a sparse file
                 #[cfg(windows)]
@@ -844,7 +855,11 @@ impl ArchiveWrite {
                 s = e; e += size_of::<u16>();
                 let perm = u16::from_le_bytes(header[s..e].try_into()?);
 
-                let fd = File::open(&entry_path)?;
+                let fd = if file_type == TYPE_DIRECTORY {
+                    &File::open(&entry_path)?
+                } else {
+                    self.f_out.as_ref().unwrap()
+                };
                 let mut permissions = fd.metadata()?.permissions();
                 let mode_masked = permissions.mode() & 0xFFFF_F000;
                 permissions.set_mode(mode_masked | u32::from(perm & 0x0FFF));
@@ -1152,17 +1167,57 @@ mod tests {
         let hardlink_path = src_dir.path.join("hardlink.txt");
         fs::hard_link(&file1_path, &hardlink_path).unwrap();
 
-        // Get original modified/accessed time of file1
+        #[cfg(unix)]
+        {
+            use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+            
+            // set permissions of file1
+            let perm1 = Permissions::from_mode(0o700);
+            fs::set_permissions(&file1_path, perm1).unwrap();
+            
+            // set permissions of subdirectory
+            let perm2 = Permissions::from_mode(0o777);
+            fs::set_permissions(&sub_dir, perm2).unwrap();
+        }
+
+        // Set modified/accessed time of file1
+        filetime::set_file_times(
+            &file1_path,
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2000)),    
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(1000))
+        ).unwrap();
+
+        // Set modified/accessed time of subdirectory
+        filetime::set_file_times(
+            &sub_dir,
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2222)),    
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(1111))
+        ).unwrap();
+
+        // Set modified/accessed time of symlink
+        filetime::set_symlink_file_times(
+            &symlink_path,
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(4444)),    
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(3333))
+        ).unwrap();
+
+        // Get modified/accessed time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
         let modified_orig1 = meta_orig1.modified().unwrap();
         let accessed_orig1 = meta_orig1.accessed().unwrap();
 
-        // Get original modified time of subdirectory
+        // Get modified/accessed time of subdirectory
         let meta_orig2 = fs::metadata(&sub_dir).unwrap();
         let modified_orig2 = meta_orig2.modified().unwrap();
+        let accessed_orig2 = meta_orig2.accessed().unwrap();        
+
+         // Get modified/accessed time of symlink
+        let meta_orig3 = fs::symlink_metadata(&symlink_path).unwrap();
+        let modified_orig3 = meta_orig3.modified().unwrap();
+        let accessed_orig3 = meta_orig3.accessed().unwrap();   
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""), false);
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last) = reader.read_chunk().unwrap();
@@ -1183,7 +1238,7 @@ mod tests {
         assert!(!src_dir.path.exists());
 
         // Perform extraction using ArchiveWrite by feeding it in small chunks
-        let mut writer = ArchiveWrite::new(None);
+        let mut writer = ArchiveWrite::new(None, false);
         for chunk in archive_bytes.chunks(100) {
             writer.write_files(chunk).unwrap();
         }
@@ -1196,6 +1251,84 @@ mod tests {
         assert!(sub_dir.exists());
         assert!(file2_path.exists());
         assert!(sparse_path.exists());
+
+        // Verify modified/accessed time of file1 is restored (seconds precision)
+        let meta_restored1 = fs::metadata(&file1_path).unwrap();
+        let modified_restored1 = meta_restored1.modified().unwrap();
+        assert_eq!(
+            modified_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+        let accessed_restored1 = meta_restored1.accessed().unwrap();
+        assert_eq!(
+            accessed_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            accessed_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        // Verify modified/accessed time of subdir is restored (seconds precision)
+        let meta_restored2 = fs::metadata(&sub_dir).unwrap();
+        let modified_restored2 = meta_restored2.modified().unwrap();
+        assert_eq!(
+            modified_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+        let accessed_restored2 = meta_restored2.accessed().unwrap();
+        assert_eq!(
+            accessed_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            accessed_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Verify permissions of file1
+            let permission_mode1 = meta_restored1.permissions().mode() & 0x0FFF;
+            assert_eq!(permission_mode1, 0o700);
+
+            // Verify permissions of subdir
+            let permission_mode2 = meta_restored2.permissions().mode() & 0x0FFF;
+            assert_eq!(permission_mode2, 0o777);
+        }
+
+        // Verify symlink
+        assert!(symlink_path.exists());
+        let symlink_metadata = fs::symlink_metadata(&symlink_path).unwrap();
+        assert!(symlink_metadata.file_type().is_symlink());
+        let target = fs::read_link(&symlink_path).unwrap();
+        assert_eq!(target, Path::new("file1.txt"));
+
+        // Verify modified/accessed time of symlink is restored (seconds precision)
+        let modified_restored3 = symlink_metadata.modified().unwrap();
+        assert_eq!(
+            modified_orig3.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored3.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );       
+        let accessed_restored3 = symlink_metadata.accessed().unwrap();
+        assert_eq!(
+            accessed_orig3.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            accessed_restored3.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        // Verify hardlink
+        #[cfg(unix)]
+        {
+            assert!(hardlink_path.exists());
+            use std::os::unix::fs::MetadataExt;
+            let meta_f1 = fs::metadata(&file1_path).unwrap();
+            let meta_hl = fs::metadata(&hardlink_path).unwrap();
+            assert_eq!(meta_f1.ino(), meta_hl.ino());
+            assert_eq!(meta_f1.nlink(), meta_hl.nlink());
+        }
+        #[cfg(windows)]
+        {
+            assert!(hardlink_path.exists());
+            let (num_links_f1, file_id_f1) = ArchiveRead::file_meta_for_hardlink_on_windows(&file1_path).unwrap();
+            let (num_links_hl, file_id_hl) = ArchiveRead::file_meta_for_hardlink_on_windows(&hardlink_path).unwrap();
+            assert_eq!(file_id_f1, file_id_hl);
+            assert_eq!(num_links_f1, 2);
+            assert_eq!(num_links_hl, 2);
+        }
 
         // Verify contents
         assert_eq!(fs::read(&file1_path).unwrap(), content1);
@@ -1224,53 +1357,6 @@ mod tests {
             assert_eq!(hole.end, 131072);
         }
 
-        // Verify modified/accessed time of file1 is restored (seconds precision)
-        let meta_restored1 = fs::metadata(&file1_path).unwrap();
-        let modified_restored1 = meta_restored1.modified().unwrap();
-        assert_eq!(
-            modified_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
-        let accessed_restored1 = meta_restored1.accessed().unwrap();
-        assert_eq!(
-            accessed_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            accessed_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
-
-        // Verify modified time of subdir is restored (seconds precision)
-        let meta_restored2 = fs::metadata(&sub_dir).unwrap();
-        let modified_restored2 = meta_restored2.modified().unwrap();
-        assert_eq!(
-            modified_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            modified_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
-
-        // Verify symlink
-        assert!(symlink_path.exists());
-        let symlink_metadata = fs::symlink_metadata(&symlink_path).unwrap();
-        assert!(symlink_metadata.file_type().is_symlink());
-        let target = fs::read_link(&symlink_path).unwrap();
-        assert_eq!(target, Path::new("file1.txt"));
-        
-        // Verify hardlink
-        #[cfg(unix)]
-        {
-            assert!(hardlink_path.exists());
-            use std::os::unix::fs::MetadataExt;
-            let meta_f1 = fs::metadata(&file1_path).unwrap();
-            let meta_hl = fs::metadata(&hardlink_path).unwrap();
-            assert_eq!(meta_f1.ino(), meta_hl.ino());
-            assert_eq!(meta_f1.nlink(), meta_hl.nlink());
-        }
-        #[cfg(windows)]
-        {
-            assert!(hardlink_path.exists());
-            let (num_links_f1, file_id_f1) = ArchiveRead::file_meta_for_hardlink_on_windows(&file1_path).unwrap();
-            let (num_links_hl, file_id_hl) = ArchiveRead::file_meta_for_hardlink_on_windows(&hardlink_path).unwrap();
-            assert_eq!(file_id_f1, file_id_hl);
-            assert_eq!(num_links_f1, 2);
-            assert_eq!(num_links_hl, 2);
-        }
     }
 
    #[test]
@@ -1324,7 +1410,7 @@ mod tests {
 
 
         // Perform archiving using ArchiveRead
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""), false);
         let mut archive_bytes = Vec::new();
         for i in 0..=128 {
             let (chunk, last_chunk) = reader.read_chunk().unwrap();
@@ -1343,7 +1429,7 @@ mod tests {
 
 
         // Perform extraction using ArchiveWrite
-        let mut writer = ArchiveWrite::new(None);
+        let mut writer = ArchiveWrite::new(None, false);
         for chunk in archive_bytes.chunks(CHUNK_SIZE) {
             writer.write_files(chunk).unwrap();
         }
@@ -1438,7 +1524,7 @@ mod tests {
 
     #[test]
     fn test_archive_nonexistent_dir() {
-        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"), Path::new(""), Path::new(""));
+        let mut reader = ArchiveRead::new(Path::new("test_archive_does_not_exist"), Path::new(""), Path::new(""), false);
         let (chunk, last) = reader.read_chunk().unwrap();
         assert!(last);
         assert!(chunk.is_empty());
@@ -1449,7 +1535,7 @@ mod tests {
     fn test_archive_empty_dir() {
         let src_dir = TestDir::new("test_archive_empty");
         
-        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""));
+        let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""), false);
         let mut archive_bytes = Vec::new();
 
         let (chunk, last) = reader.read_chunk().unwrap();
@@ -1462,7 +1548,7 @@ mod tests {
         fs::remove_dir_all(&src_dir.path).unwrap();
 
         // Extract
-        let mut writer = ArchiveWrite::new(None);
+        let mut writer = ArchiveWrite::new(None, false);
         writer.write_files(&archive_bytes).unwrap();
         writer.write_others().unwrap();
 
