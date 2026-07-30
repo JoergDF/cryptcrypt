@@ -371,12 +371,14 @@ impl Decryption {
             }
         } 
         
-        if archive {
-            println!("Archive file will be extracted to directory {}", output_dir.display());
-        } else {
-            println!("Output will be written to file {}", filepath_out.display());
+        if verbose {
+            if archive {
+                println!("Archive file will be extracted to directory {}", output_dir.display());
+            } else {
+                println!("Output will be written to file {}", filepath_out.display());
+            }
         }
-
+        
         // get password and keys
         let key = Self::hash_password(salt_pw, keyfilepath)?;
         let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;

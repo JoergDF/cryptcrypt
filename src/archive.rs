@@ -436,11 +436,8 @@ impl ArchiveRead {
 
             // sparse file
             // if the files can be scanned for sparse parts, the holes are saved in the archive header
-            if let Ok(mut f_in) = File::open(entry.path()) 
-            && let Ok(segs) = f_in.scan_chunks() {
-                sparse_segments = segs;            
-                
-                // println!("arch: {}  {:?}", entry.path().display(), sparse_segments);
+            if let Ok(mut f_in) = File::open(entry.path()) && let Ok(segs) = f_in.scan_chunks() {
+                sparse_segments = segs;
 
                 // number of holes
                 let holes_count = sparse_segments.holes().count();
@@ -452,6 +449,9 @@ impl ArchiveRead {
                     archive_header.extend(hole.start.to_le_bytes());
                     archive_header.extend(hole.end.to_le_bytes());
                 }
+            } else {
+                // scan for sparse holes failed, handle file as non-sparse and add holes_count = 0
+                archive_header.extend(0u16.to_le_bytes());
             }
 
         } else if entry_type == TYPE_SYMLINK_FILE || entry_type == TYPE_SYMLINK_DIR {

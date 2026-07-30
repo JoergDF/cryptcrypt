@@ -35,7 +35,7 @@ struct Args {
       value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
     split: Vec<u64>,
 
-    /// Show entries during archive operation
+    /// Show details about operations
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
 

@@ -416,7 +416,9 @@ impl Encryption {
         
         let (filepath_out, build_archive, strip_dir) = Self::set_paths(filepath_in, dirpath_out, split.is_empty())?;
 
-        println!("Output will be written to {}", filepath_out.display());
+        if verbose {
+            println!("Output will be written to {}", filepath_out.display());
+        }
         
         // ask for password, before there can be error messages of archive 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
