@@ -33,8 +33,8 @@ impl Encryption {
     ///
     /// # Returns
     ///
-    /// - `Ok([u8; SALT_SIZE])` — newly generated salt on success.
-    /// - `Err` — if RNG initialization fails.
+    /// - `Ok([u8; SALT_SIZE])` newly generated salt on success.
+    /// - `Err` if RNG initialization fails.
     fn create_salt() -> Result<[u8; SALT_SIZE]> {
         let mut salt = [0u8; SALT_SIZE];
         let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng)?;
@@ -71,11 +71,11 @@ impl Encryption {
     /// HKDF-SHA256 to produce two 32-byte keys.
     ///
     /// # Arguments
-    /// - `key` — master secret material to expand (kept in `SecretSlice<u8>`).
+    /// - `key`: master secret material to expand (kept in `SecretSlice<u8>`).
     ///
     /// # Returns
     /// - `Ok(( [u8; SALT_SIZE], SecretSlice<u8>, [u8; SALT_SIZE], SecretSlice<u8> ))` on success.
-    /// - `Err` — if HKDF expansion or random salt generation fails.
+    /// - `Err` if HKDF expansion or random salt generation fails.
     #[allow(clippy::type_complexity)]
     fn derive_keys(key: &SecretSlice<u8>) -> Result<([u8; SALT_SIZE], SecretSlice<u8>, [u8; SALT_SIZE], SecretSlice<u8>)> {
         let salt_cha = Self::create_salt()?;
@@ -107,11 +107,11 @@ impl Encryption {
     /// explicit chunk metadata.
     /// 
     /// # Arguments
-    /// - `key` — 32-byte ChaCha key held in a `SecretSlice<u8>`.
-    /// - `buf` — plaintext bytes to encrypt (one chunk).
-    /// - `chunk_count` — zero-based chunk index (incremented per chunk). Must be
+    /// - `key`: 32-byte ChaCha key held in a `SecretSlice<u8>`.
+    /// - `buf`: plaintext bytes to encrypt (one chunk).
+    /// - `chunk_count`: zero-based chunk index (incremented per chunk). Must be
     ///   the same value used when decrypting this chunk.
-    /// - `final_chunk` — `true` if this is the last chunk of the file,
+    /// - `final_chunk`: `true` if this is the last chunk of the file,
     ///   `false` otherwise. Also must match the value used at decryption.
     ///
     /// # Returns
@@ -266,7 +266,7 @@ impl Encryption {
     /// - `cpu_count`: number of worker threads to spawn.
     ///
     /// # Returns
-    /// - `Vec<thread::JoinHandle<Result<(), String>>>` — handles for all spawned threads.
+    /// - `Vec<thread::JoinHandle<Result<(), String>>>` handles for all spawned threads.
     pub fn encrypt_pipe(
         key_cha: &SecretSlice<u8>, 
         key_aes: &SecretSlice<u8>, 
@@ -394,6 +394,42 @@ impl Encryption {
         Ok((filepath_out, build_archive, strip_dir_in))
     }
 
+    /// Creates header of output file. 
+    /// 
+    /// Salts are required unencrypted, the other data is encrypted.
+    /// 
+    /// # Arguments
+    /// - `salt_pw`: salt of password hash
+    /// - `salt_cha`: salt of the ChaCha key derivation 
+    /// - `salt_aes`: salt of the AES key derivation
+    /// - `compress`: compression enabled
+    /// - `archive`: archiving enabled
+    /// - `key_cha`: key for ChaCha encryption
+    /// - `key_aes`: hey for AES encryption
+    /// 
+    /// # Returns
+    /// - `Ok(header)` contains header on success
+    /// - `Err` if encryption fails
+    fn create_header(salt_pw: &[u8], salt_cha: &[u8], salt_aes: &[u8], compress: bool, archive: bool, key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>) -> Result<Vec<u8>> {
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+
+        // cleartext header part
+        header.extend(salt_pw);
+        header.extend(salt_cha);
+        header.extend(salt_aes);
+
+        // encrypted header part
+        let buf_in = [
+            FILE_FORMAT_VERSION, 
+            u8::from(compress) | (u8::from(archive) << 1)
+        ];
+        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_in, 0, false)?;
+        let buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
+        header.extend(buf_aes);
+
+        Ok(header)
+    }
+
     /// Encrypts a file or a directory using dual-layer encryption (ChaCha20 + AES-256-GCM-SIV) 
     /// with optional compression.
     ///
@@ -417,7 +453,12 @@ impl Encryption {
         let (filepath_out, build_archive, strip_dir) = Self::set_paths(filepath_in, dirpath_out, split.is_empty())?;
 
         if verbose {
-            println!("Output will be written to {}", filepath_out.display());
+            println!("------------------------");
+            println!("File format version: {}", FILE_FORMAT_VERSION);
+            println!("Compression:         {}", if compress {"on"} else {"off"} );
+            println!("Archiving:           {}", if build_archive {"on"} else {"off"} );
+            println!("------------------------");
+            println!("Output will be written to file {}", filepath_out.display());
         }
         
         // ask for password, before there can be error messages of archive 
@@ -437,34 +478,11 @@ impl Encryption {
             Box::new( ReadInput::new(filepath_in, CHUNK_SIZE, 0)? )
         };
 
-        // file header
-        //   byte  description
-        //      0  version of file format
-        //      1  info about file format
-        //           bit 0: compression on(1)/off(0)
-        //           bit 1: archive
-        //  2..33  32-byte-salt of password hash
-        // 34..65  32-byte-salt of cha key derivation
-        // 66..97  32-byte-salt of aes key derivation
-        let mut header = Vec::with_capacity(HEADER_SIZE);
-        header.push(FILE_FORMAT_VERSION);
-        header.push(u8::from(compress) | (u8::from(build_archive) << 1));
-        header.extend(salt_pw);
-        header.extend(salt_cha);
-        header.extend(salt_aes);
-
-        if verbose {
-            println!("------------------------");
-            println!("File format version: {}", FILE_FORMAT_VERSION);
-            println!("Compression:         {}", if compress {"on"} else {"off"} );
-            println!("Archiving:           {}", if build_archive {"on"} else {"off"} );
-            println!("------------------------");
-        }
-
         // set write parameters and create output file
         let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
-
-        // write header
+        
+        // create and write header
+        let header = Self::create_header(&salt_pw, &salt_cha, &salt_aes, compress, build_archive, &key_cha, &key_aes)?;
         write_output.write_files(&header)?;
 
         CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
