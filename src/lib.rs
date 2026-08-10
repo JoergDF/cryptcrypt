@@ -23,6 +23,6 @@ pub const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USI
 pub const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
 pub const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;        // 16 bytes
 pub const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;   // 16 bytes
-pub const HEADER_SIZE: usize        = 3 * SALT_SIZE + 2 + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE;
+pub const HEADER_SIZE: usize        = 3 * SALT_SIZE + 4 + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;

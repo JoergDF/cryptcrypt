@@ -333,10 +333,11 @@ impl Decryption {
         let enc_head = &header[(3 * SALT_SIZE)..HEADER_SIZE];
 
         let buf_aes = Self::aes_decrypt_buffer(key_aes, enc_head)?;
-        let buf_cha = Self::cha_decrypt_buffer(key_cha, &buf_aes, 0, false)?;
-         
-        let file_format_version = buf_cha[0];
-        let file_format         = buf_cha[1];
+        let buf_cha = Self::cha_decrypt_buffer(key_cha, &buf_aes, u32::MAX, false)?;
+        
+        // evaluate data, ignore random bytes
+        let file_format_version = buf_cha[1];
+        let file_format         = buf_cha[3];
         let compress = (file_format & 0x01) != 0;
         let archive  = (file_format & 0x02) != 0;
 
@@ -357,7 +358,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` if file operations, password handling, or decryption fails
-    pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, verbose: bool) -> Result<()> {
+    pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, verbose: bool, list_archive: bool) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
         }
@@ -402,7 +403,8 @@ impl Decryption {
         let mut output_dir = &env::current_dir()?;
         // output directory path is used
         if let Some(dir_out) = dirpath_out {
-            if !dir_out.exists() {
+            // create user-specified output directory, if it is not an archive or archive is not just listed (and directory is missing)
+            if ((archive && !list_archive) || !archive) && !dir_out.exists() {
                 fs::create_dir_all(dir_out)?;
             }
             if archive {
@@ -426,10 +428,10 @@ impl Decryption {
             }
         }
 
+        // set write parameters and create output file
         let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
-            Box::new( ArchiveWrite::new(dirpath_out.cloned(), verbose) )
+            Box::new( ArchiveWrite::new(dirpath_out.cloned(), verbose, list_archive) )
         } else {
-            // set write parameters and create output file
             Box::new( WriteOutput::new(filepath_out, vec![])? )
         };
 

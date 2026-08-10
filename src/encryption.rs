@@ -409,7 +409,7 @@ impl Encryption {
     /// 
     /// # Returns
     /// - `Ok(header)` contains header on success
-    /// - `Err` if encryption fails
+    /// - `Err` if encryption or random data generation fails
     fn create_header(salt_pw: &[u8], salt_cha: &[u8], salt_aes: &[u8], compress: bool, archive: bool, key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>) -> Result<Vec<u8>> {
         let mut header = Vec::with_capacity(HEADER_SIZE);
 
@@ -419,11 +419,20 @@ impl Encryption {
         header.extend(salt_aes);
 
         // encrypted header part
+        
+        // random filler data
+        let mut random_data = [0u8; 2];
+        let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng)?;
+        rng.fill_bytes(&mut random_data);
+
+        // add some randomness to the constant data
         let buf_in = [
+            random_data[0],
             FILE_FORMAT_VERSION, 
-            u8::from(compress) | (u8::from(archive) << 1)
+            random_data[1],
+            u8::from(compress) | (u8::from(archive) << 1),
         ];
-        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_in, 0, false)?;
+        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_in, u32::MAX, false)?;
         let buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
         header.extend(buf_aes);
 
@@ -758,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn test_crypt() {
+    fn test_crypt_general() {
         // create file with random data for encryption
         let filepath_in = path::absolute(PathBuf::from("test_cc.bin")).unwrap();
         let mut filepath_out = filepath_in.clone();
@@ -774,7 +783,7 @@ mod tests {
         assert!(filepath_out.exists());
         // encrypted file must be different than original data
         assert_ne!(data, fs::read(&filepath_out).unwrap());
-        Decryption::decrypt(&filepath_out, None, None, false).unwrap();
+        Decryption::decrypt(&filepath_out, None, None, false, false).unwrap();
 
         // read and compare decrypted file against backup
         let decrypt_data = fs::read(&filepath_in).unwrap();
@@ -783,24 +792,28 @@ mod tests {
         // decrypt with keyfile should fail
         let filepath_kf = PathBuf::from("test_another_key.bin");
         fs::write(&filepath_kf, vec![0; 1024]).unwrap();
-        assert!(Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false).is_err());
+        assert!(Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false, false).is_err());
 
         // with compression
         fs::write(&filepath_in, &data).unwrap();
         Encryption::encrypt(&filepath_in, None, None, true, vec![], false).unwrap();
-        Decryption::decrypt(&filepath_out, None, None, false).unwrap();
+        Decryption::decrypt(&filepath_out, None, None, false, false).unwrap();
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
-        // with output directory
+        // encrypt with output directory
         let out_enc_dir = path::absolute(PathBuf::from("test_cc_enc_dir")).unwrap();
         Encryption::encrypt(&filepath_in, Some(&out_enc_dir), None, false, vec![], false).unwrap();
         assert!(&out_enc_dir.join(&filepath_out).exists());
+        // decrypt with output directory
         let out_dec_dir = path::absolute(PathBuf::from("test_cc_dec_dir")).unwrap();
-        Decryption::decrypt(&out_enc_dir.join(&filepath_out), Some(&out_dec_dir), None, false).unwrap();
+        Decryption::decrypt(&out_enc_dir.join(&filepath_out), Some(&out_dec_dir), None, false, false).unwrap();
         assert!(&out_dec_dir.join(&filepath_in).exists());
         let decrypt_data = fs::read(out_dec_dir.join(&filepath_in)).unwrap();
         assert_eq!(data, decrypt_data[..]);
+        // decrypt with output directory and list-archive mode - shouldn't have any effect
+        Decryption::decrypt(&out_enc_dir.join(&filepath_out), Some(&out_dec_dir), None, false, true).unwrap();
+        assert!(&out_dec_dir.join(&filepath_in).exists());
 
         // cleanup
         let _ = fs::remove_file(&filepath_in);
@@ -828,29 +841,29 @@ mod tests {
 
         // use keyfile, encrypt, decrypt
         Encryption::encrypt(&filepath_in, None, Some(&filepath_kf), false, vec![], false).unwrap();
-        Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false).unwrap();
+        Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false, false).unwrap();
 
         // read and compare decrypted file against original data
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // decrypt without key file
-        assert!(Decryption::decrypt(&filepath_out, None, None, false).is_err());
+        assert!(Decryption::decrypt(&filepath_out, None, None, false, false).is_err());
 
         // key file does not exist
         assert!(Encryption::encrypt(&filepath_in, None, Some(&PathBuf::from("test_miss")), false, vec![], false).is_err());
-        assert!(Decryption::decrypt(&filepath_out, None, Some(&PathBuf::from("test_miss")), false).is_err());
+        assert!(Decryption::decrypt(&filepath_out, None, Some(&PathBuf::from("test_miss")), false, false).is_err());
 
         // input file does not exist
         assert!(Encryption::encrypt(&path::absolute(PathBuf::from("test_miss")).unwrap(), None, None, false, vec![], false).is_err());
-        assert!(Decryption::decrypt(&PathBuf::from("test_miss.cce"), None, None, false).is_err());
+        assert!(Decryption::decrypt(&PathBuf::from("test_miss.cce"), None, None, false, false).is_err());
         assert!(!fs::exists("test_miss").unwrap());
         assert!(!fs::exists("test_miss.cce").unwrap());
 
         // with compression
         fs::write(&filepath_in, &data).unwrap();
         Encryption::encrypt(&filepath_in, None, Some(&filepath_kf), true, vec![], false).unwrap();
-        Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false).unwrap();
+        Decryption::decrypt(&filepath_out, None, Some(&filepath_kf), false, false).unwrap();
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
@@ -880,7 +893,7 @@ mod tests {
         data_concat.extend(fs::read("test_cc_split.bin.c02").unwrap());
         fs::write(&filepath_out, &data_concat).unwrap();
 
-        Decryption::decrypt(&filepath_out, None, None, false).unwrap();
+        Decryption::decrypt(&filepath_out, None, None, false, false).unwrap();
         // read and compare decrypted file against original data
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
@@ -888,14 +901,14 @@ mod tests {
         // concatenate files with decrypt
         let _ = fs::remove_file(&filepath_in);
         let _ = fs::remove_file(&filepath_out);
-        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None, None, false).unwrap();
+        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None, None, false, false).unwrap();
         // read and compare decrypted file against original data
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // with compression
         Encryption::encrypt(&filepath_in, None, None, true, vec![11, 12, 1024*100], false).unwrap();
-        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None, None, false).unwrap();
+        Decryption::decrypt(&PathBuf::from("test_cc_split.bin.c00"), None, None, false, false).unwrap();
         let decrypt_data = fs::read(&filepath_in).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
@@ -911,8 +924,7 @@ mod tests {
     #[test]
     fn test_crypt_archive() {
         // Create directory with files that should be archived
-        let dir_name = "test_cc_archive";
-        let dir_path = path::absolute(PathBuf::from(dir_name)).unwrap();
+        let dir_path = PathBuf::from("test_cc_archive");
         let _ = fs::remove_dir_all(&dir_path);
         fs::create_dir_all(&dir_path).unwrap();
         
@@ -934,11 +946,11 @@ mod tests {
         let symlink1 = sub_dir.join("symlink1.bin");
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(&file1, &symlink1).unwrap();
+            std::os::unix::fs::symlink(PathBuf::from("..").join("file1.bin"), &symlink1).unwrap();
         }
         #[cfg(windows)]
         {
-            std::os::windows::fs::symlink_file(&file1, &symlink1).unwrap();
+            std::os::windows::fs::symlink_file(PathBuf::from("..").join("file1.bin"), &symlink1).unwrap();
         }
 
         // create hardlink
@@ -946,15 +958,15 @@ mod tests {
         fs::hard_link(&file2, &hardlink2).unwrap();
 
         // Build archive of directory and encrypt it
-        Encryption::encrypt(&dir_path, None, None, false, vec![], false).unwrap();
+        Encryption::encrypt(&dir_path.canonicalize().unwrap(), None, None, false, vec![], false).unwrap();
 
         // Delete the original files before extracting to verify recreation
         fs::remove_dir_all(&dir_path).unwrap();
         assert!(!dir_path.exists());
         
         // Decrypt and rebuild archived directory
-        let arch_path = dir_path.with_extension(ENCRYPTED_FILE_EXT);
-        Decryption::decrypt(&arch_path, None, None, false).unwrap();
+        let archive_path = dir_path.with_extension(ENCRYPTED_FILE_EXT);
+        Decryption::decrypt(&archive_path, None, None, false, false).unwrap();
 
         // Verify structure is fully recreated
         assert!(dir_path.exists());
@@ -970,37 +982,53 @@ mod tests {
         assert_eq!(fs::read(&hardlink2).unwrap(), data2);
 
 
+        // With output directory and list-archive mode - no output should be created
+        let out_dec_dir1 = path::absolute(PathBuf::from("test_cc_dec_dir1")).unwrap();
+        let _ = fs::remove_dir_all(&out_dec_dir1);
+        Decryption::decrypt(&archive_path, Some(&out_dec_dir1), None, false, true).unwrap();
+        assert!(!out_dec_dir1.exists());
+        assert!(!out_dec_dir1.join(&file1).exists());
+
+        // With output directory and without list-archive mode - output should be created
+        Decryption::decrypt(&archive_path, Some(&out_dec_dir1), None, false, false).unwrap();
+        assert!(out_dec_dir1.exists());
+        assert!(out_dec_dir1.join(&file1).exists());
+        assert_eq!(fs::read(out_dec_dir1.join(&file1)).unwrap(), data1);
+
         // With output directory, with split, check exclusion of output archive files 
         let out_enc_dir = &dir_path; 
-        Encryption::encrypt(&dir_path, Some(out_enc_dir), None, false, vec![1000,10000], false).unwrap();
-        assert!(out_enc_dir.join(dir_name).with_extension(SPLIT_ENC_FILE_EXT).exists());
-
-        let out_dec_dir = path::absolute(PathBuf::from("test_cc_dec_dir")).unwrap();
-        let _ = fs::remove_dir_all(&out_dec_dir);
-        Decryption::decrypt(&out_enc_dir.join(dir_name).with_extension(SPLIT_ENC_FILE_EXT), Some(&out_dec_dir), None, false).unwrap();
+        Encryption::encrypt(&dir_path.canonicalize().unwrap(), Some(&out_enc_dir.canonicalize().unwrap()), None, false, vec![1000,10000], false).unwrap();
+        
+        let archive_path2 = out_enc_dir.join(&dir_path).with_extension(SPLIT_ENC_FILE_EXT);
+        assert!(archive_path2.exists());
+        let out_dec_dir2 = path::absolute(PathBuf::from("test_cc_dec_dir2")).unwrap();
+        let _ = fs::remove_dir_all(&out_dec_dir2);
+        Decryption::decrypt(&archive_path2, Some(&out_dec_dir2), None, false, false).unwrap();
         
         // Verify structure is fully recreated
-        assert!(out_dec_dir.join(dir_name).exists());
-        assert!(out_dec_dir.join(&file1).exists());
-        assert!(out_dec_dir.join(&file2).exists());
-        assert!(out_dec_dir.join(&symlink1).exists());
-        assert!(out_dec_dir.join(&hardlink2).exists());
+        assert!(out_dec_dir2.join(&dir_path).exists());
+        assert!(out_dec_dir2.join(&file1).exists());
+        assert!(out_dec_dir2.join(&file2).exists());
+        assert!(out_dec_dir2.join(&symlink1).exists());
+        assert!(out_dec_dir2.join(&hardlink2).exists());
 
         // Verify contents
-        assert_eq!(fs::read(out_dec_dir.join(&file1)).unwrap(), data1);
-        assert_eq!(fs::read(out_dec_dir.join(&file2)).unwrap(), data2);
-        assert_eq!(fs::read(out_dec_dir.join(&symlink1)).unwrap(), data1);
-        assert_eq!(fs::read(out_dec_dir.join(&hardlink2)).unwrap(), data2);
+        assert_eq!(fs::read(out_dec_dir2.join(&file1)).unwrap(), data1);
+        assert_eq!(fs::read(out_dec_dir2.join(&file2)).unwrap(), data2);
+        assert_eq!(fs::read(out_dec_dir2.join(&symlink1)).unwrap(), data1);
+        assert_eq!(fs::read(out_dec_dir2.join(&hardlink2)).unwrap(), data2);
 
         // Verify exclude of archive files
-        assert!(!out_dec_dir.join(dir_name).with_added_extension(SPLIT_ENC_FILE_EXT).exists());
-        assert!(!out_dec_dir.join(dir_name).with_added_extension("c01").exists());
-        assert!(!out_dec_dir.join(dir_name).with_added_extension("c02").exists());
+        assert!(!out_dec_dir2.join(&dir_path).with_added_extension(SPLIT_ENC_FILE_EXT).exists());
+        assert!(!out_dec_dir2.join(&dir_path).with_added_extension("c01").exists());
+        assert!(!out_dec_dir2.join(&dir_path).with_added_extension("c02").exists());
 
-        let _ = fs::remove_file(&arch_path);
+        let _ = fs::remove_file(&archive_path);
+        let _ = fs::remove_file(&archive_path2);
         let _ = fs::remove_dir_all(&dir_path);
         let _ = fs::remove_dir_all(out_enc_dir);
-        let _ = fs::remove_dir_all(&out_dec_dir);
+        let _ = fs::remove_dir_all(&out_dec_dir1);
+        let _ = fs::remove_dir_all(&out_dec_dir2);
     }
 
     #[test]
@@ -1101,6 +1129,6 @@ mod tests {
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
 
         Encryption::encrypt(&filepath_in, None, None, false, vec![], false).unwrap();
-        Decryption::decrypt(&filepath_out, None, None, false).unwrap();
+        Decryption::decrypt(&filepath_out, None, None, false, false).unwrap();
     }
 }

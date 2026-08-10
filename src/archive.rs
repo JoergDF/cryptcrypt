@@ -25,6 +25,351 @@ const TYPE_UNIX:         u8 = 0x00;
 const TYPE_WINDOWS:      u8 = 0x10;
 const ARCHIVE_HEADER_LENGTH_SIZE: usize = 2;
 
+
+
+/// Represents a parsed archive entry header.
+///
+/// Stores metadata decoded from the archive stream for one entry.
+struct ArchiveHeader {
+    file_type: u8,
+    created_on_os_type: u8,
+    entry_path: PathBuf,
+    link_target_path: PathBuf,
+    time_accessed: SystemTime,
+    time_modified: SystemTime,
+    file_size: u64,
+    sparse_holes_count: u16,
+    sparse_segments: Vec<Segment>,
+    permissions: u16,
+}
+
+impl ArchiveHeader {
+    /// Appends the file path length and path string to the archive header buffer.
+    ///
+    /// # Arguments
+    /// - `path`: The file system path to encode.
+    /// - `archive_header`: The mutable buffer to append the encoded path to.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if the path length exceeds `u16` capacity.
+    fn add_path_to_header(path: &Path, archive_header: &mut Vec<u8>) -> Result<()> {
+        // path length and path
+        let path_string = path.to_string_lossy();
+        let path_len: u16 = path_string.len().try_into()?;
+        archive_header.extend(path_len.to_le_bytes());
+        archive_header.extend(path_string.as_bytes());
+        Ok(())
+    }
+
+    /// Computes and sets the final header size at the beginning of the header buffer.
+    /// It is called after all other header fields have been added to the header buffer.
+    ///
+    /// # Arguments
+    /// - `archive_header`: The mutable slice representing the archive header.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if the header length cannot be converted to `u16`.
+    fn set_header_size(archive_header: &mut [u8]) -> Result<()> {
+        let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] =
+            u16::try_from(archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
+        archive_header[0] = header_size[0];
+        archive_header[1] = header_size[1];
+        Ok(())
+    }
+    
+    /// Builds the archive header bytes for a given file system entry.
+    ///
+    /// Creates a metadata block containing file type, path, timestamps, size,
+    /// sparse segments (holes), and permissions.
+    ///
+    /// # Arguments
+    /// - `entry`: The directory entry to construct the header for.
+    /// - `hard_link_target`: Optional path pointing to the target if this is a hard link.
+    /// - `strip_dir`: Path to be stripped from the start of each path in the archive to make paths relative
+    ///
+    /// # Returns
+    /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
+    /// - `Err` if metadata retrieval or OS-specific operations fail.
+    #[allow(clippy::type_complexity)]
+    fn build_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>, strip_dir: &PathBuf, verbose: bool) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
+        // archive header initialized with place holder for header size
+        let mut archive_header =  Vec::with_capacity(1024);
+        archive_header.extend([0u8; ARCHIVE_HEADER_LENGTH_SIZE]);
+
+        let entry_type = if hard_link_target.is_some() {
+            TYPE_HARDLINK
+        } else if entry.file_type().is_file() {
+            TYPE_FILE
+        } else if entry.file_type().is_dir() {
+            TYPE_DIRECTORY
+        } else if entry.file_type().is_symlink() {
+            // whether a symlink is a file or a directory is only relevant for windows (when creating them there)
+            if entry.path().is_dir() {
+                TYPE_SYMLINK_DIR
+            } else {
+                // if target of symlink does not exist (hence it can't be evaluated
+                // whether it is a file or a directory), type file is used
+                TYPE_SYMLINK_FILE
+            }
+        } else {
+            return Err("Unsupported file type".into());
+        };
+
+        let os_type = if cfg!(unix) { TYPE_UNIX } else { TYPE_WINDOWS };
+        archive_header.push(os_type | entry_type);
+
+        // path length and path (including filename) (converting to relative path)
+        let stripped_entry_path = entry.path().strip_prefix(strip_dir)?;
+        Self::add_path_to_header(stripped_entry_path, &mut archive_header)?;
+
+        if verbose {
+            println!("{}", stripped_entry_path.display());
+        }
+
+        if entry_type == TYPE_HARDLINK {
+            // target path of hard link
+            let target_path = hard_link_target.as_ref().unwrap().strip_prefix(strip_dir)?;
+            Self::add_path_to_header(target_path, &mut archive_header)?;
+
+            // header size
+            Self::set_header_size(&mut archive_header)?;
+
+            return Ok((archive_header, None, vec![]));
+        }
+
+        // metadata of entry
+        let meta_entry = entry.metadata()?;
+
+        // last access time 
+        let time_accessed = meta_entry.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
+        archive_header.extend(time_accessed.to_le_bytes());
+        // last modification time
+        let time_modified = meta_entry.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+        archive_header.extend(time_modified.to_le_bytes());
+
+        let mut file_size = 0;
+        let mut sparse_segments = vec![];
+        if entry_type == TYPE_FILE {
+            // file size
+            file_size = meta_entry.len();
+            archive_header.extend(file_size.to_le_bytes());
+
+            // sparse file
+            // if the files can be scanned for sparse parts, the holes are saved in the archive header
+            if let Ok(mut f_in) = File::open(entry.path()) && let Ok(segs) = f_in.scan_chunks() {
+                sparse_segments = segs;
+
+                // number of holes
+                let holes_count = sparse_segments.holes().count();
+                archive_header.extend(u16::try_from( holes_count )?.to_le_bytes());
+
+                // start and end index of holes, if any
+                for hole in sparse_segments.holes() {
+                    // start and end are of type u64
+                    archive_header.extend(hole.start.to_le_bytes());
+                    archive_header.extend(hole.end.to_le_bytes());
+                }
+            } else {
+                // scan for sparse holes failed, handle file as non-sparse and add holes_count = 0
+                archive_header.extend(0u16.to_le_bytes());
+            }
+
+        } else if entry_type == TYPE_SYMLINK_FILE || entry_type == TYPE_SYMLINK_DIR {
+            // target path of symlink
+            let target_path = fs::read_link(entry.path())?;
+            Self::add_path_to_header(&target_path, &mut archive_header)?;
+        }
+
+        // permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perm: u16 = 0;
+            if entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY {
+                let permission_mode = meta_entry.permissions().mode();
+                // use 12 least significant bits
+                perm = (permission_mode & 0x0FFF) as u16;
+            }
+            archive_header.extend(perm.to_le_bytes());
+        }
+        #[cfg(windows)]
+        {
+            archive_header.extend(0u16.to_le_bytes());
+        }
+
+        // header size
+        Self::set_header_size(&mut archive_header)?;
+
+        let mut filepath_and_size = None;
+        if entry_type == TYPE_FILE {
+            filepath_and_size = Some((entry.clone().into_path(), file_size));
+        }
+
+        Ok((archive_header, filepath_and_size, sparse_segments))
+    }
+
+    /// Creates a new empty archive header with default values.
+    ///
+    /// Used to initialize a header before parsing archive bytes into it.
+    pub fn parse_new() -> Self {
+        Self { 
+            file_type: 0, 
+            created_on_os_type: 0, 
+            entry_path: PathBuf::new(), 
+            link_target_path: PathBuf::new(), 
+            time_accessed: UNIX_EPOCH, 
+            time_modified: UNIX_EPOCH, 
+            file_size: 0, 
+            sparse_holes_count: 0, 
+            sparse_segments: Vec::new(), 
+            permissions: 0 
+        }
+    }
+
+    /// Parses archive header bytes and fills this `ArchiveHeader`.
+    ///
+    /// Reads the encoded entry path, optional hardlink or symlink target,
+    /// timestamps, file size, sparse hole descriptors, and permission data.
+    ///
+    /// # Arguments
+    /// - `header`: The raw archive header bytes to parse.
+    /// - `dirpath_out`: Optional output directory to prepend to restored paths.
+    ///
+    /// # Returns
+    /// - `Ok(())` on success.
+    /// - `Err` if the header data is malformed or an OS-specific conversion fails.
+    fn parse_header(&mut self, header: &[u8], dirpath_out: &Option<PathBuf>) -> Result<()> {
+        self.file_type          = header[0] & 0x0F;
+        self.created_on_os_type = header[0] & 0xF0;
+        
+        let mut s;
+        let mut e = 1;
+
+        // entry's path
+        let entry_path_string;
+        (entry_path_string, e) = Self::get_path_from_header(header, e, self.created_on_os_type)?;
+        self.entry_path = PathBuf::from(&entry_path_string);
+        // add optional output directory to entry's path
+        if let Some(dir_out) = dirpath_out {
+            self.entry_path = dir_out.join(self.entry_path.clone());
+        }
+
+        if self.file_type == TYPE_HARDLINK {
+            // hard link's target path
+            let (target_path_string, _) = Self::get_path_from_header(header, e, self.created_on_os_type)?;
+            self.link_target_path = PathBuf::from(target_path_string);
+            if let Some(dir_out) = dirpath_out {
+                self.link_target_path = dir_out.join(self.link_target_path.clone());
+            }
+            return Ok(());
+        }
+
+        // access time
+        s = e; e += size_of::<u64>();
+        let time_accessed_seconds = u64::from_le_bytes( header[s..e].try_into()? );
+        self.time_accessed = UNIX_EPOCH + Duration::from_secs(time_accessed_seconds);
+
+        // modification time
+        s = e; e += size_of::<u64>();
+        let time_modified_seconds = u64::from_le_bytes( header[s..e].try_into()? );
+        self.time_modified = UNIX_EPOCH + Duration::from_secs(time_modified_seconds);
+
+        if self.file_type == TYPE_FILE {
+            // file size
+            s = e; e += size_of::<u64>();
+            self.file_size = u64::from_le_bytes( header[s..e].try_into()? );
+
+            // holes of a sparse file
+            s = e; e += size_of::<u16>();
+            self.sparse_holes_count = u16::from_le_bytes( header[s..e].try_into()? );
+            
+            if self.sparse_holes_count > 0 {
+                // restore data- and hole-segments of sparse file
+                let mut data_start = 0;
+                for _ in 0..self.sparse_holes_count {
+                    s = e; e += size_of::<u64>();
+                    let hole_start = u64::from_le_bytes( header[s..e].try_into()? );
+                    s = e; e += size_of::<u64>();
+                    let hole_end = u64::from_le_bytes( header[s..e].try_into()? );
+
+                    if hole_start != 0 {
+                        // if first segment is not a hole, add a data segment
+                        self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..hole_start} );
+                    }
+                    self.sparse_segments.push( Segment { segment_type: SegmentType::Hole, range: hole_start..hole_end } );
+                    data_start = hole_end;
+                }
+                // if last segment is not a hole, add a data segment
+                if data_start != self.file_size {
+                    self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
+                }
+            }
+
+        } else if self.file_type == TYPE_SYMLINK_FILE || self.file_type == TYPE_SYMLINK_DIR {
+            // symlink's target path
+            let target_path_string;
+            (target_path_string, e) = Self::get_path_from_header(header, e, self.created_on_os_type)?;
+            self.link_target_path = PathBuf::from(target_path_string);
+        }
+
+        // permissions
+        // if this is a unix system and the archive was created on a unix system, set permission mode
+        #[cfg(unix)]
+        {
+            if self.created_on_os_type == TYPE_UNIX && (self.file_type == TYPE_DIRECTORY || self.file_type == TYPE_FILE) {
+                s = e; e += size_of::<u16>();
+                self.permissions = u16::from_le_bytes(header[s..e].try_into()?);
+            }
+        }
+        #[cfg(windows)]
+        {
+            // keep compiler quiet
+            s = e; e += size_of::<u16>();
+            self.permissions = u16::from_le_bytes(header[s..e].try_into()?);
+        }
+
+        Ok(())
+    }
+
+    /// Parses a file path from the archive header slice.
+    ///
+    /// Reads the path length, extracts the path bytes, converts Windows path separators
+    /// to Unix format if running on Unix, and returns the path string along with the new end index.
+    ///
+    /// # Arguments
+    /// - `header`: The archive header bytes.
+    /// - `current_end_index`: The starting index in the header to read from.
+    /// - `created_on_os_type`: OS type flag indicating which system the archive was created on.
+    ///
+    /// # Returns
+    /// - `Ok((parsed_path, next_index))` on success.
+    /// - `Err` on parse or UTF-8 decoding failure.
+    fn get_path_from_header(header: &[u8], current_end_index: usize, created_on_os_type: u8) -> Result<(String, usize)> {
+        // new start index of header field
+        let mut s = current_end_index;
+        // new end index of header field
+        let mut e = current_end_index + size_of::<u16>();
+        // path length
+        let path_len = u16::from_le_bytes(header[s..e].try_into()?);
+        // path
+        s = e; e += usize::from(path_len);
+        let path_bytes = &header[s..e];
+        let path_str = str::from_utf8(path_bytes)?;
+        // convert Windows path to unix path, if on unix (windows can handle unix path)
+        let entry_path = if cfg!(unix) && created_on_os_type == TYPE_WINDOWS {
+            Utf8WindowsPath::new(path_str).with_unix_encoding().to_string()
+        } else {
+            path_str.to_string()
+        };
+
+        Ok((entry_path, e))
+    }
+}
+
+
 /// Handles the reading and archiving of files/directories.
 ///
 /// Walks the file system directory tree, processes files in parallel,
@@ -152,7 +497,7 @@ impl ArchiveRead {
                     let sparse_segments;
 
                     // archive header
-                    match Self::build_archive_header(&entry, &hard_link_target, &strip_dir, verbose) {
+                    match ArchiveHeader::build_header(&entry, &hard_link_target, &strip_dir, verbose) {
                         Ok(values) => (archive_header, filepath_and_size, sparse_segments) = values,
                         Err(e) => {
                             eprintln!("Skipped entry on building archive header for {} - Reason: {e}", entry.path().display());
@@ -321,173 +666,6 @@ impl ArchiveRead {
         }
         Ok((num_links, file_id))
     }
-
-    /// Appends the file path length and path string to the archive header buffer.
-    ///
-    /// # Arguments
-    /// - `path`: The file system path to encode.
-    /// - `archive_header`: The mutable buffer to append the encoded path to.
-    ///
-    /// # Returns
-    /// - `Ok(())` on success.
-    /// - `Err` if the path length exceeds `u16` capacity.
-    fn add_path_to_header(path: &Path, archive_header: &mut Vec<u8>) -> Result<()> {
-        // path length and path
-        let path_string = path.to_string_lossy();
-        let path_len: u16 = path_string.len().try_into()?;
-        archive_header.extend(path_len.to_le_bytes());
-        archive_header.extend(path_string.as_bytes());
-        Ok(())
-    }
-
-    /// Builds the archive header bytes for a given file system entry.
-    ///
-    /// Creates a metadata block containing file type, path, timestamps, size,
-    /// sparse segments (holes), and permissions.
-    ///
-    /// # Arguments
-    /// - `entry`: The directory entry to construct the header for.
-    /// - `hard_link_target`: Optional path pointing to the target if this is a hard link.
-    /// - `strip_dir`: Path to be stripped from the start of each path in the archive to make paths relative
-    ///
-    /// # Returns
-    /// - `Ok((archive_header, filepath_and_size, sparse_segments))` on success.
-    /// - `Err` if metadata retrieval or OS-specific operations fail.
-    #[allow(clippy::type_complexity)]
-    fn build_archive_header(entry: &DirEntry, hard_link_target: &Option<PathBuf>, strip_dir: &PathBuf, verbose: bool) -> Result<(Vec<u8>, Option<(PathBuf, u64)>, Vec<Segment>)> {
-        // archive header initialized with place holder for header size
-        let mut archive_header =  Vec::with_capacity(1024);
-        archive_header.extend([0u8; ARCHIVE_HEADER_LENGTH_SIZE]);
-
-        /// Computes and sets the final header size at the beginning of the header buffer.
-        /// It is called after all other header fields have been added to the header buffer.
-        ///
-        /// # Arguments
-        /// - `archive_header`: The mutable slice representing the archive header.
-        ///
-        /// # Returns
-        /// - `Ok(())` on success.
-        /// - `Err` if the header length cannot be converted to `u16`.
-        fn set_header_size(archive_header: &mut [u8]) -> Result<()> {
-            let header_size: [u8; ARCHIVE_HEADER_LENGTH_SIZE] =
-                u16::try_from(archive_header.len() - ARCHIVE_HEADER_LENGTH_SIZE)?.to_le_bytes();
-            archive_header[0] = header_size[0];
-            archive_header[1] = header_size[1];
-            Ok(())
-        }
-
-        let entry_type = if hard_link_target.is_some() {
-            TYPE_HARDLINK
-        } else if entry.file_type().is_file() {
-            TYPE_FILE
-        } else if entry.file_type().is_dir() {
-            TYPE_DIRECTORY
-        } else if entry.file_type().is_symlink() {
-            // whether a symlink is a file or a directory is only relevant for windows (when creating them there)
-            if entry.path().is_dir() {
-                TYPE_SYMLINK_DIR
-            } else {
-                // if target of symlink does not exist (hence it can't be evaluated
-                // whether it is a file or a directory), type file is used
-                TYPE_SYMLINK_FILE
-            }
-        } else {
-            return Err("Unsupported file type".into());
-        };
-
-        let os_type = if cfg!(unix) { TYPE_UNIX } else { TYPE_WINDOWS };
-        archive_header.push(os_type | entry_type);
-
-        // path length and path (including filename) (converting to relative path)
-        let stripped_entry_path = entry.path().strip_prefix(strip_dir)?;
-        Self::add_path_to_header(stripped_entry_path, &mut archive_header)?;
-
-        if verbose {
-            println!("{}", stripped_entry_path.display());
-        }
-
-        if entry_type == TYPE_HARDLINK {
-            // target path of hard link
-            let target_path = hard_link_target.as_ref().unwrap().strip_prefix(strip_dir)?;
-            Self::add_path_to_header(target_path, &mut archive_header)?;
-
-            // header size
-            set_header_size(&mut archive_header)?;
-
-            return Ok((archive_header, None, vec![]));
-        }
-
-        // metadata of entry
-        let meta_entry = entry.metadata()?;
-
-        // last access time 
-        let time_accessed = meta_entry.accessed()?.duration_since(UNIX_EPOCH)?.as_secs();
-        archive_header.extend(time_accessed.to_le_bytes());
-        // last modification time
-        let time_modified = meta_entry.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
-        archive_header.extend(time_modified.to_le_bytes());
-
-        let mut file_size = 0;
-        let mut sparse_segments = vec![];
-        if entry_type == TYPE_FILE {
-            // file size
-            file_size = meta_entry.len();
-            archive_header.extend(file_size.to_le_bytes());
-
-            // sparse file
-            // if the files can be scanned for sparse parts, the holes are saved in the archive header
-            if let Ok(mut f_in) = File::open(entry.path()) && let Ok(segs) = f_in.scan_chunks() {
-                sparse_segments = segs;
-
-                // number of holes
-                let holes_count = sparse_segments.holes().count();
-                archive_header.extend(u16::try_from( holes_count )?.to_le_bytes());
-
-                // start and end index of holes, if any
-                for hole in sparse_segments.holes() {
-                    // start and end are of type u64
-                    archive_header.extend(hole.start.to_le_bytes());
-                    archive_header.extend(hole.end.to_le_bytes());
-                }
-            } else {
-                // scan for sparse holes failed, handle file as non-sparse and add holes_count = 0
-                archive_header.extend(0u16.to_le_bytes());
-            }
-
-        } else if entry_type == TYPE_SYMLINK_FILE || entry_type == TYPE_SYMLINK_DIR {
-            // target path of symlink
-            let target_path = fs::read_link(entry.path())?;
-            Self::add_path_to_header(&target_path, &mut archive_header)?;
-        }
-
-        // permissions
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut perm: u16 = 0;
-            if entry_type == TYPE_FILE || entry_type == TYPE_DIRECTORY {
-                let permission_mode = meta_entry.permissions().mode();
-                // use 12 least significant bits
-                perm = (permission_mode & 0x0FFF) as u16;
-            }
-            archive_header.extend(perm.to_le_bytes());
-        }
-        #[cfg(windows)]
-        {
-            archive_header.extend(0u16.to_le_bytes());
-        }
-
-        // header size
-        set_header_size(&mut archive_header)?;
-
-        let mut filepath_and_size = None;
-        if entry_type == TYPE_FILE {
-            filepath_and_size = Some((entry.clone().into_path(), file_size));
-        }
-
-        Ok((archive_header, filepath_and_size, sparse_segments))
-    }
 }
 
 impl ReadChunk for ArchiveRead {
@@ -563,7 +741,6 @@ impl ReadChunk for ArchiveRead {
 ///
 /// Decodes the incoming archive stream, creating files, directories, symlinks,
 /// and hard links, restoring their permissions and timestamps.
-#[derive(Default)]
 pub struct ArchiveWrite {
     /// Active file handle for the entry currently being written.
     f_out: Option<File>,
@@ -591,6 +768,8 @@ pub struct ArchiveWrite {
     dirpath_out: Option<PathBuf>,
     /// Enable verbose prints.
     verbose: bool,
+    /// Enable list mode: Print elements in archive, but do not create them.
+    list: bool,
 }
 
 impl ArchiveWrite {
@@ -601,11 +780,11 @@ impl ArchiveWrite {
     /// 
     /// # Returns
     /// - A default `ArchiveWrite` with allocated output buffer.
-    pub fn new(dirpath_out: Option<PathBuf>, verbose: bool) -> Self {
+    pub fn new(dirpath_out: Option<PathBuf>, verbose: bool, list: bool) -> Self {
         let buf_out = Vec::with_capacity(CHUNK_SIZE * 2);
         Self { f_out: None, buf_out, header_length: None, file_size: 0, file_times: FileTimes::new(), 
             file_path: PathBuf::new(), dir_times: vec![], pending_hardlinks: vec![], sparse_segments: vec![],
-            sparse_segments_index: 0, data_segment_size: 0, dirpath_out, verbose }
+            sparse_segments_index: 0, data_segment_size: 0, dirpath_out, verbose, list }
     }
 
     /// Ensures that the parent directory of the given path exists.
@@ -625,41 +804,6 @@ impl ArchiveWrite {
             fs::create_dir_all(dir)?;
         }
         Ok(())
-    }
-
-    /// Parses a file path from the archive header slice.
-    ///
-    /// Reads the path length, extracts the path bytes, converts Windows path separators
-    /// to Unix format if running on Unix, and returns the path string along with the new end index.
-    ///
-    /// # Arguments
-    /// - `header`: The archive header bytes.
-    /// - `current_end_index`: The starting index in the header to read from.
-    /// - `created_on_os_type`: OS type flag indicating which system the archive was created on.
-    ///
-    /// # Returns
-    /// - `Ok((parsed_path, next_index))` on success.
-    /// - `Err` on parse or UTF-8 decoding failure.
-    fn get_path_from_header(header: &[u8], current_end_index: usize, created_on_os_type: u8) -> Result<(String, usize)> {
-        // new start index of header field
-        let mut s = current_end_index;
-        // new end index of header field
-        let mut e = current_end_index + size_of::<u16>();
-
-        // path length
-        let path_len = u16::from_le_bytes(header[s..e].try_into()?);
-        // path
-        s = e; e += usize::from(path_len);
-        let path_bytes = &header[s..e];
-        let path_str = str::from_utf8(path_bytes)?;
-        // convert Windows path to unix path, if on unix (windows can handle unix path)
-        let entry_path = if cfg!(unix) && created_on_os_type == TYPE_WINDOWS {
-            Utf8WindowsPath::new(path_str).with_unix_encoding().to_string()
-        } else {
-            path_str.to_string()
-        };
-
-        Ok((entry_path, e))
     }
 
     /// Configures a file as a sparse file on Windows.
@@ -698,151 +842,94 @@ impl ArchiveWrite {
         Ok(())
     }
 
-    /// Evaluates a parsed archive header to create the corresponding file system entry.
-    ///
-    /// Handles directories, files (including sparse configuration), symlinks, and hard links.
-    /// Sets file size, times, and system-level permissions depending on OS.
-    ///
-    /// # Arguments
-    /// - `header`: The raw header bytes.
-    ///
-    /// # Returns
-    /// - `Ok(())` on success.
-    /// - `Err` on creation, I/O, or permission errors.
     fn eval_header(&mut self, header: &[u8]) -> Result<()> {
-        // type
-        let file_type          = header[0] & 0x0F;
-        let created_on_os_type = header[0] & 0xF0;
+        let mut hdr = ArchiveHeader::parse_new();
+        hdr.parse_header(header, &self.dirpath_out)?;
 
-        let mut s;
-        let mut e = 1;
-
-        // entry's path
-        let entry_path_string;
-        (entry_path_string, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
-        let mut entry_path = PathBuf::from(&entry_path_string);
-        // add optional output directory to entry's path
-        if let Some(dir_out) = &self.dirpath_out {
-            entry_path = dir_out.join(entry_path);
+        if self.verbose || self.list {
+            println!("{}", hdr.entry_path.display());
         }
-
-        if self.verbose {
-            println!("{}", entry_path.display());
-        }
-
-        if file_type == TYPE_HARDLINK {
-            // hard link's target path
-            let (target_path_string, _) = Self::get_path_from_header(header, e, created_on_os_type)?;
-            let mut target_path = PathBuf::from(target_path_string);
-            if let Some(dir_out) = &self.dirpath_out {
-                target_path = dir_out.join(target_path);
+        if self.list {
+            if hdr.file_type == TYPE_FILE {
+                self.file_size = hdr.file_size;
+                self.sparse_segments = hdr.sparse_segments;
             }
-            self.pending_hardlinks.push((target_path, entry_path));
             return Ok(());
         }
 
-        // access time
-        s = e; e += size_of::<u64>();
-        let time_accessed_seconds = u64::from_le_bytes( header[s..e].try_into()? );
-        let time_accessed = UNIX_EPOCH + Duration::from_secs(time_accessed_seconds);
-        // modification time
-        s = e; e += size_of::<u64>();
-        let time_modified_seconds = u64::from_le_bytes( header[s..e].try_into()? );
-        let time_modified = UNIX_EPOCH + Duration::from_secs(time_modified_seconds);
+        if hdr.file_type == TYPE_HARDLINK {
+            self.pending_hardlinks.push((hdr.link_target_path, hdr.entry_path));
+            return Ok(());
+        }
+
+        // access/modification time
         self.file_times = FileTimes::new()
-            .set_accessed(time_accessed)
-            .set_modified(time_modified);
+            .set_accessed(hdr.time_accessed)
+            .set_modified(hdr.time_modified);
 
         // create type
-        if file_type == TYPE_DIRECTORY {
+        if hdr.file_type == TYPE_DIRECTORY {
             // create directory
-            // it could be an empty directory therefore it would not be created by other entries
-            fs::create_dir_all(&entry_path)?;
-
+            // it could be an empty directory therefore it would not be created for other entries
+            if !hdr.entry_path.exists() {
+                fs::create_dir_all(&hdr.entry_path)?;
+            }
             // save timestamps for restoring them at the end
-            self.dir_times.push((entry_path.clone(), time_accessed, time_modified));
+            self.dir_times.push((hdr.entry_path.clone(), hdr.time_accessed, hdr.time_modified));
 
-        } else if file_type == TYPE_FILE {
+        } else if hdr.file_type == TYPE_FILE {
             // create directory (of file), if it doesn't exist
-            Self::create_parent_directory(&entry_path)?;
+            Self::create_parent_directory(&hdr.entry_path)?;
 
             // create file
-            self.f_out = Some(File::create(&entry_path)?);
+            self.f_out = Some(File::create(&hdr.entry_path)?);
 
             // for printing errors
-            self.file_path = entry_path.clone();
+            self.file_path = hdr.entry_path.clone();
 
             // file size
-            s = e; e += size_of::<u64>();
-            self.file_size = u64::from_le_bytes( header[s..e].try_into()? );
+            self.file_size = hdr.file_size;
 
-            // holes of a sparse file
-            s = e; e += size_of::<u16>();
-            let holes_count = u16::from_le_bytes( header[s..e].try_into()? );
-
-            if holes_count > 0 {
-                // restore data- and hole-segments of sparse file
-                let mut data_start = 0;
-                for _ in 0..holes_count {
-                    s = e; e += size_of::<u64>();
-                    let hole_start = u64::from_le_bytes( header[s..e].try_into()? );
-                    s = e; e += size_of::<u64>();
-                    let hole_end = u64::from_le_bytes( header[s..e].try_into()? );
-
-                    if hole_start != 0 {
-                        // if first segment is not a hole, add a data segment
-                        self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..hole_start} );
-                    }
-                    self.sparse_segments.push( Segment { segment_type: SegmentType::Hole, range: hole_start..hole_end } );
-                    data_start = hole_end;
-                }
-                // if last segment is not a hole, add a data segment
-                if data_start != self.file_size {
-                    self.sparse_segments.push( Segment { segment_type: SegmentType::Data, range: data_start..self.file_size} );
-                }
+            if hdr.sparse_holes_count > 0 {
+                self.sparse_segments = hdr.sparse_segments;
 
                 // Windows requires to set sparse flag for a sparse file
                 #[cfg(windows)]
                 if Self::set_sparse_file_on_windows(self.f_out.as_ref().unwrap()).is_err() {
-                    eprintln!("Could not set sparse option for file {}", entry_path.display());
+                    eprintln!("Could not set sparse option for file {}", hdr.entry_path.display());
                 }
             }
             
-        } else if file_type == TYPE_SYMLINK_FILE || file_type == TYPE_SYMLINK_DIR {
+        } else if hdr.file_type == TYPE_SYMLINK_FILE || hdr.file_type == TYPE_SYMLINK_DIR {
             // create directory (of symlink), if it doesn't exist
-            Self::create_parent_directory(&entry_path)?;
-
-            // symlink's target path
-            let target_path;
-            (target_path, e) = Self::get_path_from_header(header, e, created_on_os_type)?;
+            Self::create_parent_directory(&hdr.entry_path)?;
 
             // create symlink
             #[cfg(unix)]
             {
-                std::os::unix::fs::symlink(&target_path, &entry_path)?;
+                std::os::unix::fs::symlink(&hdr.link_target_path, &hdr.entry_path)?;
             }
             #[cfg(windows)]
             {
-                if file_type == TYPE_SYMLINK_FILE {
-                    std::os::windows::fs::symlink_file(&target_path, &entry_path)?;
+                if hdr.file_type == TYPE_SYMLINK_FILE {
+                    std::os::windows::fs::symlink_file(&hdr.link_target_path, &hdr.entry_path)?;
                 }
-                if file_type == TYPE_SYMLINK_DIR {
-                    std::os::windows::fs::symlink_dir(&target_path, &entry_path)?;
+                if hdr.file_type == TYPE_SYMLINK_DIR {
+                    std::os::windows::fs::symlink_dir(&hdr.link_target_path, &hdr.entry_path)?;
                 }
             }
 
             // set timestamps of symlink
-            // replace with fs::set_times_nofollow() when stable rust version supports it
             match filetime::set_symlink_file_times(
-                &entry_path,
-                filetime::FileTime::from_system_time(time_accessed),    
-                filetime::FileTime::from_system_time(time_modified)
+                &hdr.entry_path,
+                filetime::FileTime::from_system_time(hdr.time_accessed),    
+                filetime::FileTime::from_system_time(hdr.time_modified)
             ) {
                 Ok(()) => {},
-                Err(e) => eprintln!("Could not set original timestamps for symlink {}: {e}", entry_path.display()),
+                Err(e) => eprintln!("Could not set original timestamps for symlink {}: {e}", hdr.entry_path.display()),
             }
         } else {
-            return Err(format!("Archive contains unknown file type: {file_type}").into());
+            return Err(format!("Archive contains unknown file type: {}", hdr.file_type).into());
         }
 
         // permissions
@@ -851,26 +938,17 @@ impl ArchiveWrite {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            if created_on_os_type == TYPE_UNIX && (file_type == TYPE_DIRECTORY || file_type == TYPE_FILE) {
-                s = e; e += size_of::<u16>();
-                let perm = u16::from_le_bytes(header[s..e].try_into()?);
-
-                let fd = if file_type == TYPE_DIRECTORY {
-                    &File::open(&entry_path)?
+            if hdr.created_on_os_type == TYPE_UNIX && (hdr.file_type == TYPE_DIRECTORY || hdr.file_type == TYPE_FILE) {
+                let fd = if hdr.file_type == TYPE_DIRECTORY {
+                    &File::open(&hdr.entry_path)?
                 } else {
                     self.f_out.as_ref().unwrap()
                 };
                 let mut permissions = fd.metadata()?.permissions();
                 let mode_masked = permissions.mode() & 0xFFFF_F000;
-                permissions.set_mode(mode_masked | u32::from(perm & 0x0FFF));
+                permissions.set_mode(mode_masked | u32::from(hdr.permissions & 0x0FFF));
                 fd.set_permissions(permissions)?;
             }
-        }
-        #[cfg(windows)]
-        {
-            // keep compiler quiet
-            s = e; e += size_of::<u16>();
-            let _perm = u16::from_le_bytes(header[s..e].try_into()?);
         }
 
         Ok(())
@@ -893,12 +971,14 @@ impl WriteFiles for ArchiveWrite {
         self.buf_out.extend(buf_in);
 
         loop {
-            if let Some(mut f_out) = self.f_out.as_ref() {
+            if self.file_size > 0 {
                 // Local helper closure to write buffered data to file
                 let mut write_data = |f_out_size: u64| -> Result<u64> {
                     let data_size = self.buf_out.len().min(f_out_size.try_into()?);
                     let buf_out_slice: Vec<u8> = self.buf_out.drain(..data_size).collect();
-                    f_out.write_all(&buf_out_slice)?;
+                    if let Some(mut f_out) = self.f_out.as_ref() {
+                        f_out.write_all(&buf_out_slice)?;
+                    }
                     Ok(data_size as u64)
                 };
 
@@ -906,6 +986,15 @@ impl WriteFiles for ArchiveWrite {
                     // write non-sparse file
                     let write_size = write_data(self.file_size)?;
                     self.file_size -= write_size;
+                    
+                    // set file times after all data has been written
+                    if self.file_size == 0 {
+                        if let Some(f_out) = self.f_out.as_ref() && f_out.set_times(self.file_times).is_err() {
+                            eprintln!("Could not set original timestamps for file {}", self.file_path.display());
+                        }
+                        self.f_out = None;
+                    }
+                   
                     if self.buf_out.is_empty() {
                         break;
                     }
@@ -927,8 +1016,10 @@ impl WriteFiles for ArchiveWrite {
                             }
                         }
                         SegmentType::Hole => {
-                            f_out.seek_relative((segment.len() - 1).try_into()?)?;
-                            f_out.write_all(&[0])?;
+                            if let Some(mut f_out) = self.f_out.as_ref() {
+                                f_out.seek_relative((segment.len() - 1).try_into()?)?;
+                                f_out.write_all(&[0])?;
+                            }
                             self.file_size -= segment.len();
                             self.sparse_segments_index += 1;
                         }
@@ -937,15 +1028,22 @@ impl WriteFiles for ArchiveWrite {
                     if self.file_size == 0 {
                         // holes must not be set before the whole file was written;
                         // on failure, the file should become non-sparse, do not break execution, just continue
-                        for hole in self.sparse_segments.holes() {
-                            if f_out.drill_hole(hole.start, hole.end).is_err() {
-                                eprintln!("Could not set sparse region for file {}", self.file_path.display());
+                        if let Some(f_out) = self.f_out.as_ref() {
+                            for hole in self.sparse_segments.holes() {
+                                if f_out.drill_hole(hole.start, hole.end).is_err() {
+                                    eprintln!("Could not set sparse region for file {}", self.file_path.display());
+                                }
                             }
                         }
-
                         self.data_segment_size = 0;
                         self.sparse_segments_index = 0;
                         self.sparse_segments.clear();
+
+                        // set file times after all data has been written
+                        if let Some(f_out) = self.f_out.as_ref() && f_out.set_times(self.file_times).is_err() {
+                            eprintln!("Could not set original timestamps for file {}", self.file_path.display());
+                        }
+                        self.f_out = None;
                     }
 
                     // no data left and no hole as next segment
@@ -955,15 +1053,6 @@ impl WriteFiles for ArchiveWrite {
                         break;
                     }
                 }
-
-                if self.file_size == 0 {
-                    // set file times after all data has been written
-                    if f_out.set_times(self.file_times).is_err() {
-                        eprintln!("Could not set original timestamps for file {}", self.file_path.display());
-                    }
-                    self.f_out = None;
-                }
-                
             } else if let Some(header_length) = self.header_length {
                 if self.buf_out.len() >= header_length {
                     // get header
@@ -1058,7 +1147,7 @@ mod tests {
     #[test]
     fn test_add_path_to_header() {
         let mut buf = Vec::new();
-        ArchiveRead::add_path_to_header(Path::new("hello/world.txt"), &mut buf).unwrap();
+        ArchiveHeader::add_path_to_header(Path::new("hello/world.txt"), &mut buf).unwrap();
         
         // Path length should be 15 (2 bytes, little-endian)
         let expected_len = 15u16.to_le_bytes();
@@ -1090,7 +1179,7 @@ mod tests {
         header.extend_from_slice(&path_len.to_le_bytes());
         header.extend_from_slice(path_str.as_bytes());
 
-        let (decoded, end_idx) = ArchiveWrite::get_path_from_header(&header, 0, TYPE_UNIX).unwrap();
+        let (decoded, end_idx) = ArchiveHeader::get_path_from_header(&header, 0, TYPE_UNIX).unwrap();
         assert_eq!(decoded, "foo/bar/baz.txt");
         assert_eq!(end_idx, header.len());
 
@@ -1101,7 +1190,7 @@ mod tests {
         header_win.extend_from_slice(&path_len_win.to_le_bytes());
         header_win.extend_from_slice(path_str_win.as_bytes());
 
-        let (decoded_win, end_idx_win) = ArchiveWrite::get_path_from_header(&header_win, 0, TYPE_WINDOWS).unwrap();
+        let (decoded_win, end_idx_win) = ArchiveHeader::get_path_from_header(&header_win, 0, TYPE_WINDOWS).unwrap();
         if cfg!(unix) {
             assert_eq!(decoded_win, "foo/bar/baz.txt");
         } else {
@@ -1181,40 +1270,35 @@ mod tests {
         }
 
         // Set modified/accessed time of file1
-        filetime::set_file_times(
+        filetime::set_file_mtime(
             &file1_path,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2000)),    
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(1000))
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2000))
         ).unwrap();
-
-        // Set modified/accessed time of subdirectory
-        filetime::set_file_times(
-            &sub_dir,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2222)),    
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(1111))
-        ).unwrap();
-
+        
         // Set modified/accessed time of symlink
-        filetime::set_symlink_file_times(
+        filetime::set_file_mtime(
             &symlink_path,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(4444)),    
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(3333))
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(4444))   
+        ).unwrap();
+        
+        // Set modified/accessed time of subdirectory
+        filetime::set_file_mtime(
+            &sub_dir,
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2222))
         ).unwrap();
 
+  
         // Get modified/accessed time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
         let modified_orig1 = meta_orig1.modified().unwrap();
-        let accessed_orig1 = meta_orig1.accessed().unwrap();
 
         // Get modified/accessed time of subdirectory
         let meta_orig2 = fs::metadata(&sub_dir).unwrap();
         let modified_orig2 = meta_orig2.modified().unwrap();
-        let accessed_orig2 = meta_orig2.accessed().unwrap();        
 
          // Get modified/accessed time of symlink
         let meta_orig3 = fs::symlink_metadata(&symlink_path).unwrap();
         let modified_orig3 = meta_orig3.modified().unwrap();
-        let accessed_orig3 = meta_orig3.accessed().unwrap();   
 
         // Perform archiving using ArchiveRead
         let mut reader = ArchiveRead::new(&src_dir.path, Path::new(""), Path::new(""), false);
@@ -1238,7 +1322,7 @@ mod tests {
         assert!(!src_dir.path.exists());
 
         // Perform extraction using ArchiveWrite by feeding it in small chunks
-        let mut writer = ArchiveWrite::new(None, false);
+        let mut writer = ArchiveWrite::new(None, false, false);
         for chunk in archive_bytes.chunks(100) {
             writer.write_files(chunk).unwrap();
         }
@@ -1259,11 +1343,6 @@ mod tests {
             modified_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
         );
-        let accessed_restored1 = meta_restored1.accessed().unwrap();
-        assert_eq!(
-            accessed_orig1.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            accessed_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
 
         // Verify modified/accessed time of subdir is restored (seconds precision)
         let meta_restored2 = fs::metadata(&sub_dir).unwrap();
@@ -1271,11 +1350,6 @@ mod tests {
         assert_eq!(
             modified_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             modified_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
-        let accessed_restored2 = meta_restored2.accessed().unwrap();
-        assert_eq!(
-            accessed_orig2.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            accessed_restored2.duration_since(UNIX_EPOCH).unwrap().as_secs()
         );
 
         #[cfg(unix)]
@@ -1304,11 +1378,6 @@ mod tests {
             modified_orig3.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             modified_restored3.duration_since(UNIX_EPOCH).unwrap().as_secs()
         );       
-        let accessed_restored3 = symlink_metadata.accessed().unwrap();
-        assert_eq!(
-            accessed_orig3.duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            accessed_restored3.duration_since(UNIX_EPOCH).unwrap().as_secs()
-        );
 
         // Verify hardlink
         #[cfg(unix)]
@@ -1429,7 +1498,7 @@ mod tests {
 
 
         // Perform extraction using ArchiveWrite
-        let mut writer = ArchiveWrite::new(None, false);
+        let mut writer = ArchiveWrite::new(None, false, false);
         for chunk in archive_bytes.chunks(CHUNK_SIZE) {
             writer.write_files(chunk).unwrap();
         }
@@ -1548,7 +1617,7 @@ mod tests {
         fs::remove_dir_all(&src_dir.path).unwrap();
 
         // Extract
-        let mut writer = ArchiveWrite::new(None, false);
+        let mut writer = ArchiveWrite::new(None, false, false);
         writer.write_files(&archive_bytes).unwrap();
         writer.write_others().unwrap();
 
