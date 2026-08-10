@@ -7,7 +7,9 @@ use rand::RngExt;
 use std::time::SystemTime;
 use glob::glob;
 use cryptcrypt::common_io;
-use cryptcrypt::SPLIT_ENC_FILE_EXT;
+use cryptcrypt::common_io::WriteFiles;
+use cryptcrypt::common_io::ReadChunk;
+use cryptcrypt::{AES_NONCE_SIZE, AES_TAG_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, SPLIT_ENC_FILE_EXT};
 
 
 // directory for temporary input/output files (could be a RAM disk)
@@ -29,9 +31,10 @@ fuzz_target!(|input: (&[u8], Vec<u16>)| {
     let mut wr = common_io::WriteOutput::new(filepath.clone(), split_u64).unwrap();
     wr.write_files(&[0]).unwrap(); // header
     wr.write_files(&data).unwrap();
-
+    wr.write_files(&[0; CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE]).unwrap();
+    
     // read split files
-    let mut rd = common_io::ReadInput::new(filepath, 100, 1).unwrap();
+    let mut rd = common_io::ReadInput::new(&filepath, 100, 1).unwrap();
     // header
     let mut hdr = [1u8];
     rd.read_files(&mut hdr).unwrap();
@@ -44,6 +47,7 @@ fuzz_target!(|input: (&[u8], Vec<u16>)| {
         (dat, final_chunk) = rd.read_chunk().unwrap();
         data_out.extend(dat);
     }
+    data_out.truncate(data_out.len() - (CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE));
 
     // input data and read data should be the same
     assert_eq!(data, data_out);

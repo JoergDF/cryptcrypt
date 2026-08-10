@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{self, PathBuf};
 use clap::Parser;
 use std::process::ExitCode;
 use parse_size::Config;
@@ -9,11 +9,15 @@ use cryptcrypt::Result;
 
 #[derive(Parser)]
 #[command(version, about, verbatim_doc_comment, long_about = None)]
-/// Program for encryption and decryption of a file.
-/// If no option is given, file is encrypted. 
+/// Application for encryption and decryption of file or directory.
+/// If no option is given, input is encrypted. Providing a directory creates an encrypted archive.
 /// With option -s the encrypted output is split into files with extensions .c00, .c01, .c02, ...
-/// If a file ending on .c00 is decrypted, the whole split series will be read.
+/// If a file ending in .c00 is decrypted, the whole split series will be read.
 struct Args {
+    /// Output directory, it is created if it does not exist
+    #[arg(short, long)]
+    out_dir: Option<PathBuf>,
+
     /// Decrypt file (with extension '.cce' or for split series '.c00')
     #[arg(short, long, default_value_t = false)]
     decrypt: bool,
@@ -31,8 +35,17 @@ struct Args {
       value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
     split: Vec<u64>,
 
-    /// File that should be encrypted or decrypted
-    file: PathBuf,
+    #[arg(short, long, default_value_t = false)]
+    /// List elements of an archive file, do not create its elements
+    list_archive: bool,
+
+    /// Show details about operations
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+
+    /// File that should be encrypted or decrypted. 
+    /// If a directory is given, its contents is archived and encrypted.
+    file_or_directory: PathBuf,
 }
 
 /// Main entry point for the cryptcrypt application.
@@ -46,7 +59,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("Error: {}", e);
             ExitCode::FAILURE
         }
     }
@@ -58,14 +71,15 @@ fn main() -> ExitCode {
 /// based on the provided flags.
 fn run() -> Result<()> {
     let args = Args::parse();
- 
-    let filepath = args.file.canonicalize()?;
-    let keyfilepath = args.keyfile.map(|path| path.canonicalize()).transpose()?;
+
+    let filepath = args.file_or_directory.canonicalize()?;
+    let keyfilepath = args.keyfile.map(|keyf| keyf.canonicalize()).transpose()?;
+    let output_dir = args.out_dir.map(path::absolute).transpose()?;
 
     if args.decrypt {
-        Decryption::decrypt(&filepath, keyfilepath.as_ref())?;
+        Decryption::decrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.verbose, args.list_archive)?;
     } else {
-        Encryption::encrypt(&filepath, keyfilepath.as_ref(), args.compress, args.split)?;
+        Encryption::encrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.compress, args.split, args.verbose)?;
     }
 
     Ok(())
