@@ -363,15 +363,6 @@ impl Decryption {
             return Err("Cannot decrypt a directory".into());
         }
 
-        let mut filepath_out = filepath_in.clone();
-        if filepath_in.extension() == Some(std::ffi::OsStr::new(ENCRYPTED_FILE_EXT)) ||
-           filepath_in.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
-            // remove encrypted-file-extension
-            filepath_out.set_extension("");
-        } else {
-            return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT} or .{SPLIT_ENC_FILE_EXT}").into())
-        }
-
         // set read parameters
         let mut read_input = Box:: new( ReadInput::new(
             filepath_in, 
@@ -400,20 +391,34 @@ impl Decryption {
             ).into());
         }
 
-        let mut output_dir = &env::current_dir()?;
-        // output directory path is used
+        let mut filepath_out = PathBuf::from(filepath_in.file_name().unwrap());
+        if filepath_in.extension() == Some(std::ffi::OsStr::new(ENCRYPTED_FILE_EXT)) ||
+           filepath_in.extension() == Some(std::ffi::OsStr::new(SPLIT_ENC_FILE_EXT)) {
+            // remove encrypted-file-extension
+            filepath_out.set_extension("");
+        } else {
+            return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT} or .{SPLIT_ENC_FILE_EXT}").into())
+        }
+
+        // use output directory path ot current working directory
+        let output_dir =
         if let Some(dir_out) = dirpath_out {
             // create user-specified output directory, if it is not an archive or archive is not just listed (and directory is missing)
             if ((archive && !list_archive) || !archive) && !dir_out.exists() {
                 fs::create_dir_all(dir_out)?;
             }
-            if archive {
-                output_dir = dir_out;
+            // canonicalize directory, as relative output path elements like ".." might not be resolved
+            // in list mode, directory might not exist
+            if dir_out.exists() {
+                dir_out.canonicalize()?
             } else {
-                let filename_out = filepath_out.file_name().unwrap();
-                filepath_out = dir_out.join(filename_out);
+                dir_out.to_path_buf()
             }
-        } 
+        } else {
+            env::current_dir()?
+        };
+
+        filepath_out = output_dir.join(filepath_out);
 
         if verbose {
             println!("--------------------------");
@@ -430,7 +435,12 @@ impl Decryption {
 
         // set write parameters and create output file
         let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
-            Box::new( ArchiveWrite::new(dirpath_out.cloned(), verbose, list_archive) )
+            // convert relative path elements to absolute ones (looks better for verbose print)
+            // in list mode, directory might not exist
+            let dirpath_out_absolute = dirpath_out.map(|p| 
+                if p.exists() { p.canonicalize() } else { Ok(p.to_path_buf()) }
+            ).transpose()?;         
+            Box::new( ArchiveWrite::new(dirpath_out_absolute, verbose, list_archive) )
         } else {
             Box::new( WriteOutput::new(filepath_out, vec![])? )
         };

@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::{fs, thread};
+use std::env;
 use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305};
 use rand::{Rng, SeedableRng};
@@ -350,6 +351,7 @@ impl Encryption {
     ///
     /// # Arguments
     /// - `filepath_in`: Path to the input file or directory to be encrypted.
+    /// - `working_dir`: Path to current working directory
     /// - `dirpath_out`: Optional path to a directory where the encrypted output should be saved.
     /// - `no_split`: Boolean flag indicating if output splitting is disabled.
     ///
@@ -359,7 +361,7 @@ impl Encryption {
     ///   - `build_archive`: Boolean indicating whether the input is a directory.
     ///   - `strip_dir_in`: Optional directory path that should be stripped from the start of the absolute archive path.
     /// - `Err` if absolute path resolution fails.
-    fn set_paths(filepath_in: &Path, dirpath_out: Option<&PathBuf>, no_split: bool) -> Result<(PathBuf, bool, Option<PathBuf>)> {
+    fn set_paths(filepath_in: &Path, working_dir: &Path, dirpath_out: Option<&PathBuf>, no_split: bool) -> Result<(PathBuf, bool, Option<PathBuf>)> {
         assert!(filepath_in.is_absolute());
     
         let build_archive = filepath_in.is_dir();
@@ -374,13 +376,17 @@ impl Encryption {
         } else {
             filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
         }
-        // output directory path is used
-        // build path, but create directory after password entry
+       
+        // use output directory path ot current working directory
+        let output_dir =
         if let Some(dir_out) = dirpath_out {
             assert!(dir_out.is_absolute());
-            let filename_out = filepath_out.file_name().unwrap();
-            filepath_out = dir_out.join(filename_out);
-        }
+            dir_out
+        } else {
+            working_dir
+        };
+        let filename_out = filepath_out.file_name().unwrap();
+        filepath_out = output_dir.join(filename_out);
 
         let mut strip_dir_in = None;
         if build_archive {
@@ -458,8 +464,22 @@ impl Encryption {
     /// - `Ok(())` on successful encryption
     /// - `Err` if file operations, password handling, or encryption fails
     pub fn encrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, compress: bool, split: Vec<u64>, verbose: bool) -> Result<()> {
-        
-        let (filepath_out, build_archive, strip_dir) = Self::set_paths(filepath_in, dirpath_out, split.is_empty())?;
+
+        let (mut filepath_out, build_archive, strip_dir) = Self::set_paths(filepath_in, &env::current_dir()?, dirpath_out, split.is_empty())?;
+
+        // ask for password, before there can be error messages of archive 
+        let (salt_pw, key) = Self::hash_password(keyfilepath)?;
+        let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
+
+        // output directory path is used
+        // create a new directory after password entry: 
+        // if password entry failed or user breaks execution at password entry, filesystem stays unchanged
+        if let Some(dir_out) = dirpath_out && !dir_out.exists() {
+            fs::create_dir_all(dir_out)?;
+        }
+
+        // canonicalize directory part, as relative output path elements like ".." might not be resolved
+        filepath_out = filepath_out.parent().unwrap().canonicalize()?.join(filepath_out.file_name().unwrap());
 
         if verbose {
             println!("------------------------");
@@ -468,17 +488,6 @@ impl Encryption {
             println!("Archiving:           {}", if build_archive {"on"} else {"off"} );
             println!("------------------------");
             println!("Output will be written to file {}", filepath_out.display());
-        }
-        
-        // ask for password, before there can be error messages of archive 
-        let (salt_pw, key) = Self::hash_password(keyfilepath)?;
-        let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
-
-        // output directory path is used
-        // create a new directory after password entry: 
-        // if password entry failed or user breaks execution on password entry, filesystem stays unchanged
-        if let Some(dir_out) = dirpath_out && !dir_out.exists() {
-            fs::create_dir_all(dir_out)?;
         }
 
         let read_input: Box<dyn ReadChunk> = if build_archive {
@@ -489,7 +498,7 @@ impl Encryption {
 
         // set write parameters and create output file
         let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
-        
+     
         // create and write header
         let header = Self::create_header(&salt_pw, &salt_cha, &salt_aes, compress, build_archive, &key_cha, &key_aes)?;
         write_output.write_files(&header)?;
@@ -1050,7 +1059,7 @@ mod tests {
 
         // 1. File input, no output dir, no split
         {
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, None, true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, &test_dir, None, true).unwrap();
             assert!(!archive);
             assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
@@ -1060,7 +1069,7 @@ mod tests {
 
         // 2. File input, no output dir, with split
         {
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, None, false).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, &test_dir, None, false).unwrap();
             assert!(!archive);
             assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
@@ -1070,7 +1079,7 @@ mod tests {
 
         // 3. File input, with output dir, no split
         {
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, Some(&output_dir), true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&test_file, &test_dir, Some(&output_dir), true).unwrap();
             assert!(!archive);
             assert_eq!(strip_dir, None);
             let mut expected = test_file.clone();
@@ -1081,7 +1090,7 @@ mod tests {
 
         // 4. Directory input (sub_dir), no output dir, no split
         {
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, None, true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, &test_dir, None, true).unwrap();
             assert!(archive);
             assert_eq!(strip_dir, Some(test_dir.clone()));
             let mut expected = sub_dir.clone();
@@ -1091,7 +1100,7 @@ mod tests {
 
         // 5. Directory input (sub_dir), with output dir, with split
         {
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, Some(&output_dir), false).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&sub_dir, &test_dir, Some(&output_dir), false).unwrap();
             assert!(archive);
             assert_eq!(strip_dir, Some(test_dir.clone()));
             let mut expected = PathBuf::from("sub_dir");
@@ -1108,10 +1117,10 @@ mod tests {
             } else {
                 PathBuf::from("c:/")
             };
-            let (file_out, archive, strip_dir) = Encryption::set_paths(&root_path, None, true).unwrap();
+            let (file_out, archive, strip_dir) = Encryption::set_paths(&root_path, &test_dir, None, true).unwrap();
             assert!(archive);
             assert_eq!(strip_dir, Some(root_path.clone()));
-            let mut expected = root_path.join("archive");
+            let mut expected = test_dir.join("archive");
             expected.add_extension(ENCRYPTED_FILE_EXT);
             assert_eq!(file_out, expected);
         }
