@@ -89,7 +89,7 @@ impl Decryption {
     pub fn cha_decrypt_buffer(key: &SecretSlice<u8>, buf: &[u8], chunk_count: u32, final_chunk: bool) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init decryption: {:?}", e))?;
-        let mut nonce = *XNonce::from_slice(&buf[..CHA_NONCE_SIZE]);
+        let mut nonce = XNonce::try_from(&buf[..CHA_NONCE_SIZE])?;
         
         // change nonce by XOR of final chunk flag and chunk count
         nonce[0] ^= u8::from(final_chunk);
@@ -118,8 +118,8 @@ impl Decryption {
     pub fn aes_decrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init decryption: {:?}", e))?;
-        let nonce = Nonce::from_slice(&buf[..AES_NONCE_SIZE]);
-        let decrypted_buf = cipher.decrypt(nonce, &buf[AES_NONCE_SIZE..])
+        let nonce = Nonce::try_from(&buf[..AES_NONCE_SIZE])?;
+        let decrypted_buf = cipher.decrypt(&nonce, &buf[AES_NONCE_SIZE..])
             .map_err(|e| format!("Failed to decrypt data: {:?}", e))?; 
 
         Ok(decrypted_buf)

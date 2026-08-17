@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use std::{fs, thread};
 use std::env;
 use argon2::Argon2;
-use chacha20poly1305::{XChaCha20Poly1305};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::{Rng, SeedableRng};
 use rand::rngs::SysRng;
 use rand_chacha::ChaCha20Rng;
-use aes_gcm_siv::{aead::{Aead, KeyInit, OsRng}, Aes256GcmSiv, AeadCore};
+use aes_gcm_siv::{aead::{Aead, KeyInit, Generate}, Aes256GcmSiv, Nonce};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::Compression;
 use bzip2::read::BzEncoder;
@@ -121,7 +121,7 @@ impl Encryption {
     pub fn cha_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8], chunk_count: u32, final_chunk: bool) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
-        let mut nonce = XChaCha20Poly1305::generate_nonce(OsRng);
+        let mut nonce =  XNonce::try_generate()?;
         let nonce_org = nonce;
 
         // change nonce by XOR of chunk count and final chunk flag
@@ -156,7 +156,7 @@ impl Encryption {
     pub fn aes_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
         let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
             .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
-        let nonce =  Aes256GcmSiv::generate_nonce(OsRng);
+        let nonce = Nonce::try_generate()?;
         let mut encrypted_buf = cipher.encrypt(&nonce, buf)
             .map_err(|e| format!("Failed to encrypt data: {:?}", e))?;
 
