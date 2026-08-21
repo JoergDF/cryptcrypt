@@ -3,7 +3,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
-use secrecy::SecretSlice;
+use chacha20poly1305::XChaCha20Poly1305;
+use aes_gcm_siv::Aes256GcmSiv;
 use std::collections::HashMap;
 use num_cpus;
 
@@ -266,8 +267,8 @@ impl CryptIo {
     /// using parallelism by threads and writes the results.
     ///
     /// # Arguments
-    /// - `key_cha`: Cryptographic key for XChaCha20-Poly1305
-    /// - `key_aes`: Cryptographic key for AES-256-GCM-SIV 
+    /// - `cipher_cha`: cipher struct for XChaCha20-Poly1305 
+    /// - `cipher_aes`: cipher struct for AES-256-GCM-SIV 
     /// - `compress`: Compress data before encryption, decompress after decryption
     /// - `crypt_fn`: Cryptographic function processing compression, XChaCha20-Poly1305, AES-256-GCM-SIV
     ///
@@ -276,12 +277,12 @@ impl CryptIo {
     /// - `Err` if file I/O fails, channels fail or cryptographic functions fail   
     #[allow(clippy::type_complexity)]
     pub fn io_chunks(
-        key_cha: &SecretSlice<u8>, 
-        key_aes: &SecretSlice<u8>,
+        cipher_cha: &XChaCha20Poly1305, 
+        cipher_aes: &Aes256GcmSiv,
         compress: bool,
         crypt_fn: fn(
-            &SecretSlice<u8>, 
-            &SecretSlice<u8>,
+            &XChaCha20Poly1305,
+            &Aes256GcmSiv,
             bool,
             Receiver<(Vec<u8>, u32, bool)>, 
             Sender<(Vec<u8>, u32)>,
@@ -297,7 +298,7 @@ impl CryptIo {
         let (tx_out, rx_out) = bounded(cpu_count);
 
         // compress (optionally) and encrypt/decrypt in threads
-        let crypt_handles = crypt_fn(key_cha, key_aes, compress, rx_in, tx_out, cpu_count);
+        let crypt_handles = crypt_fn(cipher_cha, cipher_aes, compress, rx_in, tx_out, cpu_count);
 
         // write output file(s) in a thread
         // chunks have to be ordered first, as durations of parallel threads varies

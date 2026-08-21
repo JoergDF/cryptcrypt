@@ -7,7 +7,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use rand::{Rng, SeedableRng};
 use rand::rngs::SysRng;
 use rand_chacha::ChaCha20Rng;
-use aes_gcm_siv::{aead::{Aead, KeyInit, Generate}, Aes256GcmSiv, Nonce};
+use aes_gcm_siv::{aead::{KeyInit, Generate}, Aes256GcmSiv, AeadInOut, Nonce};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
 use bzip2::Compression;
 use bzip2::read::BzEncoder;
@@ -96,9 +96,10 @@ impl Encryption {
     /// - the subsequent bytes with the little-endian bytes of `chunk_count`
     ///
     /// The encryption uses the modified nonce, but the original nonce
-    /// (`nonce_org`) is prepended to the resulting output so the stream can be
+    /// (`nonce_org`) is appended to the resulting output so the stream can be
     /// reconstructed and the modified nonce recomputed during decryption.
-    ///
+    /// The nonce is appended (and not prepended) for faster execution.
+    /// 
     /// The stored `nonce_org` plus the caller-supplied `chunk_count` and
     /// `final_chunk` are required to reconstruct the exact nonce during decryption. 
     /// Mismatched values will cause decryption failures.
@@ -108,19 +109,17 @@ impl Encryption {
     /// explicit chunk metadata.
     /// 
     /// # Arguments
-    /// - `key`: 32-byte ChaCha key held in a `SecretSlice<u8>`.
-    /// - `buf`: plaintext bytes to encrypt (one chunk).
+    /// - `cipher`: XChaCha20-Poly1305 cipher struct initialized with key.
+    /// - `buf_inout`: data-in: plaintext bytes to encrypt (one chunk); data-out: containing ciphertext (+ authentication tag) + nonce
     /// - `chunk_count`: zero-based chunk index (incremented per chunk). Must be
     ///   the same value used when decrypting this chunk.
     /// - `final_chunk`: `true` if this is the last chunk of the file,
     ///   `false` otherwise. Also must match the value used at decryption.
     ///
     /// # Returns
-    /// - `Ok(encrypted_data)` containing nonce + ciphertext (+ authentication tag)
-    /// - `Err(...)` if initialization or encryption fails
-    pub fn cha_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8], chunk_count: u32, final_chunk: bool) -> Result<Vec<u8>> {
-        let cipher = XChaCha20Poly1305::new_from_slice(key.expose_secret())
-            .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
+    /// - `Ok()` on successful encryption
+    /// - `Err(...)` if encryption fails
+    pub fn cha_encrypt_buffer(cipher: &XChaCha20Poly1305, buf_inout: &mut Vec<u8>, chunk_count: u32, final_chunk: bool) -> Result<()> {
         let mut nonce =  XNonce::try_generate()?;
         let nonce_org = nonce;
 
@@ -130,41 +129,29 @@ impl Encryption {
         for (i, ccb) in chunk_count.to_le_bytes().iter().enumerate() {
             nonce[i+1] ^= ccb;
         }
-
-        let mut encrypted_buf = cipher.encrypt(&nonce, buf)
-            .map_err(|e| format!("Failed to encrypt data: {:?}", e))?;
-
-        let mut combined_data = Vec::with_capacity(CHA_NONCE_SIZE + buf.len() + CHA_TAG_SIZE);
-        combined_data.extend(&nonce_org);
-        combined_data.append(&mut encrypted_buf);
-
-        Ok(combined_data)
+        cipher.encrypt_in_place(&nonce, &[], buf_inout)?;
+        buf_inout.extend(nonce_org);
+        Ok(())
     }
 
     /// Encrypts a buffer using AES-256-GCM-SIV.
     ///
     /// Generates a random nonce and encrypts the buffer. The output includes
-    /// the length of nonce + ciphertext, the nonce and the ciphertext for transmission.
-    ///
+    /// the ciphertext and the nonce for transmission.
+    /// The nonce is appended (and not prepended) for faster execution.
+    /// 
     /// # Arguments
-    /// - `key`: 32‑byte AES key stored in a `SecretSlice<u8>`
-    /// - `buf`: Data to encrypt
+    /// - `cipher`: AES-256-GCM-SIV cipher struct initialized with key.
+    /// - `buf_inout`: data-in: plaintext bytes to encrypt (one chunk); data-out: containing ciphertext (+ authentication tag) + nonce
     ///
     /// # Returns
-    /// - `Ok(encrypted_data)` containing nonce + ciphertext (+ authentication tag)
-    /// - `Err` if initialization or encryption fails
-    pub fn aes_encrypt_buffer(key: &SecretSlice<u8>, buf: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Aes256GcmSiv::new_from_slice(key.expose_secret())
-            .map_err(|e| format!("Failed to init encryption: {:?}", e))?;
+    /// - `Ok()` on successful encryption
+    /// - `Err(...)` if encryption fails
+    pub fn aes_encrypt_buffer(cipher: &Aes256GcmSiv, buf_inout: &mut Vec<u8>) -> Result<()> {
         let nonce = Nonce::try_generate()?;
-        let mut encrypted_buf = cipher.encrypt(&nonce, buf)
-            .map_err(|e| format!("Failed to encrypt data: {:?}", e))?;
-
-        let mut combined_data = Vec::with_capacity(AES_NONCE_SIZE + buf.len() + AES_TAG_SIZE);
-        combined_data.extend(nonce);
-        combined_data.append(&mut encrypted_buf);
-
-        Ok(combined_data)
+        cipher.encrypt_in_place(&nonce, &[], buf_inout)?;
+        buf_inout.extend(&nonce);
+        Ok(())
     }
 
     /// Compresses a byte buffer using bzip2 compression.
@@ -259,8 +246,8 @@ impl Encryption {
     ///   then AES-256-GCM-SIV on the result, and sends `(Vec<u8>, u32)` to `tx_out`.
     ///
     /// # Arguments
-    /// - `key_cha`: ChaCha key for first-layer encryption.
-    /// - `key_aes`: AES key for second-layer encryption.
+    /// - `cipher_cha`: cipher struct for XChaCha20-Poly1305 encryption
+    /// - `cipher_aes`: cipher struct for AES-256-GCM-SIV encryption
     /// - `compress`: enable compression + resegment stage when true.
     /// - `rx_in`: receiver for input plaintext chunks `(data, chunk_count, final_flag)`.
     /// - `tx_out`: sender for encrypted output `(encrypted_chunk, chunk_count)`.
@@ -269,8 +256,8 @@ impl Encryption {
     /// # Returns
     /// - `Vec<thread::JoinHandle<Result<(), String>>>` handles for all spawned threads.
     pub fn encrypt_pipe(
-        key_cha: &SecretSlice<u8>, 
-        key_aes: &SecretSlice<u8>, 
+        cipher_cha: &XChaCha20Poly1305, 
+        cipher_aes: &Aes256GcmSiv,
         compress: bool, 
         rx_in: Receiver<(Vec<u8>, u32, bool)>, 
         tx_out: Sender<(Vec<u8>, u32)>, 
@@ -322,16 +309,17 @@ impl Encryption {
 
         // encryption threads
         for _ in 0..e_thread_cnt {
-            let key_cha = key_cha.clone();
-            let key_aes = key_aes.clone();
+            let cipher_cha= cipher_cha.clone();
+            let cipher_aes = cipher_aes.clone();
             let rx_in = if compress { rx_e.clone() } else { rx_in.clone() };
             let tx_out = tx_out.clone();
 
             thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> {  
-                for (buf_in, chunk_count, final_chunk) in rx_in {
-                    let buf_cha = Self::cha_encrypt_buffer(&key_cha, &buf_in, chunk_count, final_chunk).map_err(|e| e.to_string())?;
-                    let buf_aes = Self::aes_encrypt_buffer(&key_aes, &buf_cha).map_err(|e| e.to_string())?;
-                    if tx_out.send((buf_aes, chunk_count)).is_err() { break }
+                for (mut buf_inout, chunk_count, final_chunk) in rx_in {
+                    buf_inout.reserve(CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE);
+                    Self::cha_encrypt_buffer(&cipher_cha, &mut buf_inout, chunk_count, final_chunk).map_err(|e| e.to_string())?;
+                    Self::aes_encrypt_buffer(&cipher_aes, &mut buf_inout).map_err(|e| e.to_string())?;
+                    if tx_out.send((buf_inout, chunk_count)).is_err() { break }
                 }
                 Ok(())
             }));
@@ -377,7 +365,7 @@ impl Encryption {
             filepath_out.add_extension(SPLIT_ENC_FILE_EXT);
         }
        
-        // use output directory path ot current working directory
+        // use output directory path or current working directory
         let output_dir =
         if let Some(dir_out) = dirpath_out {
             assert!(dir_out.is_absolute());
@@ -410,21 +398,25 @@ impl Encryption {
     /// - `salt_aes`: salt of the AES key derivation
     /// - `compress`: compression enabled
     /// - `archive`: archiving enabled
-    /// - `key_cha`: key for ChaCha encryption
-    /// - `key_aes`: hey for AES encryption
+    /// - `cipher_cha`: cipher struct for ChaCha encryption
+    /// - `cipher_aes`: cipher struct for AES encryption
     /// 
     /// # Returns
     /// - `Ok(header)` contains header on success
     /// - `Err` if encryption or random data generation fails
-    fn create_header(salt_pw: &[u8], salt_cha: &[u8], salt_aes: &[u8], compress: bool, archive: bool, key_cha: &SecretSlice<u8>, key_aes: &SecretSlice<u8>) -> Result<Vec<u8>> {
+    fn create_header(salt_pw: &[u8], salt_cha: &[u8], salt_aes: &[u8], compress: bool, archive: bool, cipher_cha: &XChaCha20Poly1305, cipher_aes: &Aes256GcmSiv) -> Result<Vec<u8>> {
         let mut header = Vec::with_capacity(HEADER_SIZE);
 
+        //
         // cleartext header part
+        //
         header.extend(salt_pw);
         header.extend(salt_cha);
         header.extend(salt_aes);
 
+        //
         // encrypted header part
+        //
         
         // random filler data
         let mut random_data = [0u8; 2];
@@ -432,15 +424,18 @@ impl Encryption {
         rng.fill_bytes(&mut random_data);
 
         // add some randomness to the constant data
-        let buf_in = [
+        let mut buf_inout = vec![
             random_data[0],
             FILE_FORMAT_VERSION, 
             random_data[1],
             u8::from(compress) | (u8::from(archive) << 1),
         ];
-        let buf_cha = Self::cha_encrypt_buffer(key_cha, &buf_in, u32::MAX, false)?;
-        let buf_aes = Self::aes_encrypt_buffer(key_aes, &buf_cha)?;
-        header.extend(buf_aes);
+        buf_inout.reserve(CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE);
+
+        Self::cha_encrypt_buffer(cipher_cha, &mut buf_inout, u32::MAX, false)?;
+        Self::aes_encrypt_buffer(cipher_aes, &mut buf_inout)?;
+
+        header.extend(buf_inout);
 
         Ok(header)
     }
@@ -470,6 +465,8 @@ impl Encryption {
         // ask for password, before there can be error messages of archive 
         let (salt_pw, key) = Self::hash_password(keyfilepath)?;
         let (salt_cha, key_cha, salt_aes, key_aes) = Self::derive_keys(&key)?;
+        let cipher_cha = XChaCha20Poly1305::new_from_slice(key_cha.expose_secret())?;
+        let cipher_aes = Aes256GcmSiv::new_from_slice(key_aes.expose_secret())?;
 
         // output directory path is used
         // create a new directory after password entry: 
@@ -500,10 +497,10 @@ impl Encryption {
         let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
      
         // create and write header
-        let header = Self::create_header(&salt_pw, &salt_cha, &salt_aes, compress, build_archive, &key_cha, &key_aes)?;
+        let header = Self::create_header(&salt_pw, &salt_cha, &salt_aes, compress, build_archive, &cipher_cha, &cipher_aes)?;
         write_output.write_files(&header)?;
 
-        CryptIo::io_chunks(&key_cha, &key_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
+        CryptIo::io_chunks(&cipher_cha, &cipher_aes, compress, Self::encrypt_pipe, read_input, write_output)?;
         
         Ok(())
     }
@@ -574,68 +571,96 @@ mod tests {
     fn test_chacha_crypt_buffer() {
         let key: [u8; 32]  = rand::random();
         let key = SecretSlice::from(key.to_vec());
+        let cipher_cha = XChaCha20Poly1305::new_from_slice(key.expose_secret()).unwrap();
         let data: [u8; 100] = rand::random();
 
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0, false).unwrap();
         assert_eq!(encrypt_data.len(), data.len() + CHA_NONCE_SIZE + CHA_TAG_SIZE);
+
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0, false).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // second encryption must produce different output of the same input
-        let encrypt_data2 = Encryption::cha_encrypt_buffer(&key, &data, 0, false).unwrap();
-        // nonce part must be different
-        assert_ne!(encrypt_data[..CHA_NONCE_SIZE], encrypt_data2[..CHA_NONCE_SIZE]);
+        let mut encrypt_data2 = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data2, 0, false).unwrap();
+        // nonce part (at the end) must be different
+        assert_ne!(
+            encrypt_data[encrypt_data.len() - CHA_NONCE_SIZE..],
+            encrypt_data2[encrypt_data2.len() - CHA_NONCE_SIZE..]
+        );
         // encrypted data part must be different
-        assert_ne!(encrypt_data[CHA_NONCE_SIZE..], encrypt_data2[CHA_NONCE_SIZE..]);
+        assert_ne!(
+            encrypt_data[..encrypt_data.len() - CHA_NONCE_SIZE],
+            encrypt_data2[..encrypt_data2.len() - CHA_NONCE_SIZE]
+        );
 
-        // corrupt nonce
+        // corrupt nonce (at the end of the buffer)
         let mut bad_data = encrypt_data.clone();
-        bad_data[0] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&key, &bad_data, 0, false).is_err());
+        let last_idx = bad_data.len() - 1;
+        bad_data[last_idx] ^= 0xFF;
+        assert!(Decryption::cha_decrypt_buffer(&cipher_cha, &mut bad_data, 0, false).is_err());
 
         // corrupt data
         let mut bad_data = encrypt_data.clone();
-        bad_data[CHA_NONCE_SIZE+1] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&key, &bad_data, 0, false).is_err());
+        bad_data[0] ^= 0xFF;
+        assert!(Decryption::cha_decrypt_buffer(&cipher_cha, &mut bad_data, 0, false).is_err());
 
         // wrong key
         let mut bad_key = key.clone();
         bad_key.expose_secret_mut()[0] ^= 0xFF;
-        assert!(Decryption::cha_decrypt_buffer(&bad_key, &encrypt_data, 0, false).is_err());
+        let bad_cipher_cha = XChaCha20Poly1305::new_from_slice(bad_key.expose_secret()).unwrap();
+        let mut bad_data = encrypt_data.clone();
+        assert!(Decryption::cha_decrypt_buffer(&bad_cipher_cha, &mut bad_data, 0, false).is_err());
 
         // wrong final chunk flag
-        assert!(Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, true).is_err());
+        let mut bad_data = encrypt_data.clone();
+        assert!(Decryption::cha_decrypt_buffer(&cipher_cha, &mut bad_data, 0, true).is_err());
 
         // wrong chunk count
-        assert!(Decryption::cha_decrypt_buffer(&key, &encrypt_data, 1, false).is_err());
+        let mut bad_data = encrypt_data.clone();
+        assert!(Decryption::cha_decrypt_buffer(&cipher_cha, &mut bad_data, 1, false).is_err());
 
         // different values for chunk count and final chunk flag
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0, true).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, true).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0, true).unwrap();
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0, true).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 42, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 42, false).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 42, false).unwrap();
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 42, false).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0x1000_0000, true).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0x1000_0000, true).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0x1000_0000, true).unwrap();
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0x1000_0000, true).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data, 0xFFFF_FFFF, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0xFFFF_FFFF, false).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0xFFFF_FFFF, false).unwrap();
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0xFFFF_FFFF, false).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // empty input data
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &[], 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
+        let mut encrypt_data = Vec::new();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0, false).unwrap();
         assert_eq!(encrypt_data.len(), CHA_NONCE_SIZE + CHA_TAG_SIZE);
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0, false).unwrap();
         assert_eq!(decrypt_data.len(), 0);
 
         // large input data
         let data_big = vec![0u8; CHUNK_SIZE * 2 + 123];
-        let encrypt_data = Encryption::cha_encrypt_buffer(&key, &data_big, 0, false).unwrap();
-        let decrypt_data = Decryption::cha_decrypt_buffer(&key, &encrypt_data, 0, false).unwrap();
+        let mut encrypt_data = data_big.clone();
+        Encryption::cha_encrypt_buffer(&cipher_cha, &mut encrypt_data, 0, false).unwrap();
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::cha_decrypt_buffer(&cipher_cha, &mut decrypt_data, 0, false).unwrap();
         assert_eq!(data_big, decrypt_data[..]);
     }
 
@@ -643,34 +668,48 @@ mod tests {
     fn test_aes_crypt_buffer() {
         let key: [u8; 32]  = rand::random();
         let key = SecretSlice::from(key.to_vec());
+        let cipher_aes = Aes256GcmSiv::new_from_slice(key.expose_secret()).unwrap();
         let data: [u8; 100] = rand::random();
 
-        let encrypt_data = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
-        let decrypt_data = Decryption::aes_decrypt_buffer(&key, &encrypt_data).unwrap();
+        let mut encrypt_data = data.to_vec();
+        Encryption::aes_encrypt_buffer(&cipher_aes, &mut encrypt_data).unwrap();
         assert_eq!(encrypt_data.len(), data.len() + AES_NONCE_SIZE + AES_TAG_SIZE);
+
+        let mut decrypt_data = encrypt_data.clone();
+        Decryption::aes_decrypt_buffer(&cipher_aes, &mut decrypt_data).unwrap();
         assert_eq!(data, decrypt_data[..]);
 
         // second encryption must produce different output of the same input
-        let encrypt_data2 = Encryption::aes_encrypt_buffer(&key, &data).unwrap();
-        // nonce part must be different
-        assert_ne!(encrypt_data[..AES_NONCE_SIZE], encrypt_data2[..AES_NONCE_SIZE]);
+        let mut encrypt_data2 = data.to_vec();
+        Encryption::aes_encrypt_buffer(&cipher_aes, &mut encrypt_data2).unwrap();
+        // nonce part (at the end of the buffer) must be different
+        assert_ne!(
+            encrypt_data[encrypt_data.len() - AES_NONCE_SIZE..],
+            encrypt_data2[encrypt_data2.len() - AES_NONCE_SIZE..]
+        );
         // encrypted data part must be different
-        assert_ne!(encrypt_data[3 + AES_NONCE_SIZE..], encrypt_data2[3 + AES_NONCE_SIZE..]);
+        assert_ne!(
+            encrypt_data[..encrypt_data.len() - AES_NONCE_SIZE],
+            encrypt_data2[..encrypt_data2.len() - AES_NONCE_SIZE]
+        );
 
-        // corrupt 'nonce'
+        // corrupt nonce (at the end of the buffer)
         let mut bad_data = encrypt_data.clone();
-        bad_data[1] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
+        let last_idx = bad_data.len() - 1;
+        bad_data[last_idx] ^= 0xFF;
+        assert!(Decryption::aes_decrypt_buffer(&cipher_aes, &mut bad_data).is_err());
 
-        // corrupt 'data'
+        // corrupt data
         let mut bad_data = encrypt_data.clone();
-        bad_data[AES_NONCE_SIZE + 1] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&key, &bad_data).is_err());
+        bad_data[0] ^= 0xFF;
+        assert!(Decryption::aes_decrypt_buffer(&cipher_aes, &mut bad_data).is_err());
 
         // wrong key
         let mut bad_key = key.clone();
         bad_key.expose_secret_mut()[0] ^= 0xFF;
-        assert!(Decryption::aes_decrypt_buffer(&bad_key, &encrypt_data).is_err());
+        let bad_cipher_aes = Aes256GcmSiv::new_from_slice(bad_key.expose_secret()).unwrap();
+        let mut bad_data = encrypt_data.clone();
+        assert!(Decryption::aes_decrypt_buffer(&bad_cipher_aes, &mut bad_data).is_err());
     }
 
     #[test]
@@ -1127,17 +1166,5 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_dir_all(&test_dir);
-    }
-
-    #[test]
-    #[ignore="only for benchmarking"]
-    fn test_crypt_bench() {
-        // a file 'ttt' must already exist
-        let filepath_in = PathBuf::from("ttt");     
-        let mut filepath_out = filepath_in.clone();
-        filepath_out.add_extension(ENCRYPTED_FILE_EXT);
-
-        Encryption::encrypt(&filepath_in, None, None, false, vec![], false).unwrap();
-        Decryption::decrypt(&filepath_out, None, None, false, false).unwrap();
     }
 }
