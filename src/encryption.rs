@@ -482,9 +482,9 @@ impl Encryption {
             println!("------------------------");
             println!("File format version: {}", FILE_FORMAT_VERSION);
             println!("Compression:         {}", if compress {"on"} else {"off"} );
-            println!("Archiving:           {}", if build_archive {"on"} else {"off"} );
+            println!("Archive:             {}", if build_archive {"on"} else {"off"} );
             println!("------------------------");
-            println!("Output will be written to file {}", filepath_out.display());
+            println!("Output is written to file {}", filepath_out.display());
         }
 
         let read_input: Box<dyn ReadChunk> = if build_archive {

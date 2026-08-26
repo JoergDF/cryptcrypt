@@ -422,13 +422,13 @@ impl Decryption {
         if verbose {
             println!("--------------------------");
             println!("File format version: {}", file_format_version);
-            println!("Compressed:          {}", compress);
-            println!("Archived:            {}", archive);
+            println!("Compression:         {}", compress);
+            println!("Archive:             {}", archive);
             println!("--------------------------");
             if archive {
-                println!("Archive file will be extracted to directory {}", output_dir.display());
+                println!("Archive file is extracted to directory {}", output_dir.display());
             } else {
-                println!("Output will be written to file {}", filepath_out.display());
+                println!("Output is written to file {}", filepath_out.display());
             }
         }
 

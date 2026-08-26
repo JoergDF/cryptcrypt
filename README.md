@@ -95,20 +95,19 @@ cargo run --release
 ## Encryption details
 
 1. If a key file is used, hash its first 64 MByte (maximum) with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3).
-2. Derive encryption key from password and the optional key file hash using Argon2id with a random salt. Write the salt to the output file.
+2. Derive encryption key from password and the optional key file hash using [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2) with a random salt. Write the salt to the output file.
 3. From the master key derive two independent 32‑byte keys: one for XChaCha20-Poly1305 and one for AES-256-GCM-SIV. 
 Each key is derived with [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) using its own fresh random salt. 
 Write the ChaCha salt then the AES salt immediately after the password salt.
-4. Encrypt and write file format version and file format (i.e. compression status) to the output file. (file header: password salt, ChaCha salt, AES salt, encrypted file format version, encrypted file format).
-5. Read a 1 MByte chunk from the input file (the last chunk may be smaller). 
-Keep a zero-based sequence number for each chunk and mark the final chunk with a flag.
-6. If compression is switched on, compress chunk with bzip2. Its variably sized output is copied to fixed sized, 1 MB chunks. The chunk size should not give a hint about the cleartext.
+4. Encrypt and write file format version and file format (i.e. compression and archive status) to the output file. (file header: password salt, ChaCha salt, AES salt, encrypted file format version, encrypted file format).
+5. Read a 1 MByte chunk from the input file (the last chunk may be smaller). Keep a zero-based sequence number for each chunk and mark the final chunk with a flag.
+6. If compression is switched on, compress chunk with [bzip2](https://github.com/trifectatechfoundation/bzip2-rs). Its variably sized output is copied to fixed sized, 1 MB chunks. The chunk size should not give a hint about the cleartext.
 7. First-pass encrypt the chunk with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) 
 using a fresh random base nonce generated per chunk. For the actual encryption nonce the implementation derives a per-chunk nonce 
-by XOR’ing the base nonce with the chunk’s sequence number and the final-chunk flag; the original base nonce is stored before the 
+by XOR’ing the base nonce with the chunk’s sequence number and the final-chunk flag; the original base nonce is stored after the 
 ChaCha ciphertext so the per-chunk nonce can be recomputed during decryption. Reordering or truncating the chunk sequence would cause a decryption error.
 8. Second-pass encrypt the output of step 7 with [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) 
-using a fresh random nonce; the AES nonce is stored before the AES ciphertext and written to the (split) output file.
+using a fresh random nonce; the AES nonce is stored after the AES ciphertext and written to the (split) output file.
 9. Repeat steps 5–8 until all input is processed.
 
 ## License
