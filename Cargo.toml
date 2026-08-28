@@ -1,11 +1,11 @@
 [package]
 name = "cryptcrypt"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 
 [dependencies]
 aes-gcm-siv = "0.12.0"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 bzip2 = "0.6.1"
 chacha20poly1305 = "0.11.0"
 chrono = "0.4.45"

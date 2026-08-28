@@ -997,7 +997,9 @@ impl WriteFiles for ArchiveWrite {
         self.buf_out.extend(buf_in);
 
         loop {
-            if self.file_size > 0 {
+            // if list mode: no file is created, hence self.f_out is none
+            // else: file with size 0 must get its timestamp
+            if (!self.list && self.f_out.is_some()) || (self.list && self.file_size > 0) { 
                 // Local helper closure to write buffered data to file
                 let mut write_data = |f_out_size: u64| -> Result<u64> {
                     let data_size = self.buf_out.len().min(f_out_size.try_into()?);
@@ -1295,34 +1297,44 @@ mod tests {
             fs::set_permissions(&sub_dir, perm2).unwrap();
         }
 
-        // Set modified/accessed time of file1
+        // Set modified time of file1
         filetime::set_file_mtime(
             &file1_path,
             filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2000))
         ).unwrap();
         
-        // Set modified/accessed time of symlink
+        // Set modified time of empty file
+        filetime::set_file_mtime(
+            &empty_file_path,
+            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(3000))
+        ).unwrap();
+        
+        // Set modified time of symlink
         filetime::set_file_mtime(
             &symlink_path,
             filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(4444))   
         ).unwrap();
         
-        // Set modified/accessed time of subdirectory
+        // Set modified time of subdirectory
         filetime::set_file_mtime(
             &sub_dir,
             filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2222))
         ).unwrap();
 
   
-        // Get modified/accessed time of file1
+        // Get modified time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
         let modified_orig1 = meta_orig1.modified().unwrap();
 
-        // Get modified/accessed time of subdirectory
+        // Get modified time of empty file
+        let meta_orig11 = fs::metadata(&empty_file_path).unwrap();
+        let modified_orig11 = meta_orig11.modified().unwrap();
+
+        // Get modified time of subdirectory
         let meta_orig2 = fs::metadata(&sub_dir).unwrap();
         let modified_orig2 = meta_orig2.modified().unwrap();
 
-         // Get modified/accessed time of symlink
+         // Get modified time of symlink
         let meta_orig3 = fs::symlink_metadata(&symlink_path).unwrap();
         let modified_orig3 = meta_orig3.modified().unwrap();
 
@@ -1362,7 +1374,7 @@ mod tests {
         assert!(file2_path.exists());
         assert!(sparse_path.exists());
 
-        // Verify modified/accessed time of file1 is restored (seconds precision)
+        // Verify modified time of file1 is restored (seconds precision)
         let meta_restored1 = fs::metadata(&file1_path).unwrap();
         let modified_restored1 = meta_restored1.modified().unwrap();
         assert_eq!(
@@ -1370,7 +1382,15 @@ mod tests {
             modified_restored1.duration_since(UNIX_EPOCH).unwrap().as_secs()
         );
 
-        // Verify modified/accessed time of subdir is restored (seconds precision)
+        // Verify modified time of empty file is restored (seconds precision)
+        let meta_restored11 = fs::metadata(&empty_file_path).unwrap();
+        let modified_restored11 = meta_restored11.modified().unwrap();
+        assert_eq!(
+            modified_orig11.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            modified_restored11.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+
+        // Verify modified time of subdir is restored (seconds precision)
         let meta_restored2 = fs::metadata(&sub_dir).unwrap();
         let modified_restored2 = meta_restored2.modified().unwrap();
         assert_eq!(
@@ -1398,7 +1418,7 @@ mod tests {
         let target = fs::read_link(&symlink_path).unwrap();
         assert_eq!(target, Path::new("file1.txt"));
 
-        // Verify modified/accessed time of symlink is restored (seconds precision)
+        // Verify modified time of symlink is restored (seconds precision)
         let modified_restored3 = symlink_metadata.modified().unwrap();
         assert_eq!(
             modified_orig3.duration_since(UNIX_EPOCH).unwrap().as_secs(),
