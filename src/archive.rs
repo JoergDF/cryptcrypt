@@ -883,6 +883,11 @@ impl ArchiveWrite {
             return Ok(());
         }
 
+        // Do not overwrite existing files/symlinks/hardlinks
+        if hdr.file_type != TYPE_DIRECTORY && hdr.entry_path.exists() {
+            return Err("Element already exists".into());
+        }
+
         if hdr.file_type == TYPE_HARDLINK {
             self.pending_hardlinks.push((hdr.link_target_path, hdr.entry_path));
             return Ok(());
