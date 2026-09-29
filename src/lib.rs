@@ -11,7 +11,7 @@ pub mod decryption;
 pub mod archive;
 
 
-pub const FILE_FORMAT_VERSION: u8   = 6;
+pub const FILE_FORMAT_VERSION: u8   = 7;
 pub const ENCRYPTED_FILE_EXT: &str  = "cce";
 pub const SPLIT_ENC_FILE_EXT: &str  = "c00";
 pub const CHUNK_SIZE: usize         = 1_048_576;  // 1024 * 1024 bytes
@@ -23,6 +23,7 @@ pub const AES_NONCE_SIZE: usize     = <Aes256GcmSiv as AeadCore>::NonceSize::USI
 pub const CHA_NONCE_SIZE: usize     = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE; // 24 bytes
 pub const AES_TAG_SIZE: usize       = <Aes256GcmSiv as AeadCore>::TagSize::USIZE;        // 16 bytes
 pub const CHA_TAG_SIZE: usize       = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;   // 16 bytes
-pub const HEADER_SIZE: usize        = 3 * SALT_SIZE + 4 + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE;
+pub const MAX_CREDENTIAL_ID_FIDO_SIZE: usize = 256;
+pub const HEADER_SIZE: usize = 5 * SALT_SIZE + 3 + MAX_CREDENTIAL_ID_FIDO_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE; // 487 bytes
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error>>;

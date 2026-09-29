@@ -4,18 +4,17 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 use std::fs;
 use std::env;
-use argon2::Argon2;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use aes_gcm_siv::{aead::KeyInit, Aes256GcmSiv, AeadInOut, Nonce};
-use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice};
+use aes_gcm_siv::{Aes256GcmSiv, AeadInOut, Nonce};
 use bzip2::read::BzDecoder;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
-use crate::{Result, KEY_SIZE, CHA_NONCE_SIZE, AES_NONCE_SIZE, CHUNK_SIZE, COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT,
+use crate::{Result, CHA_NONCE_SIZE, AES_NONCE_SIZE, CHUNK_SIZE, COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT,
             SPLIT_ENC_FILE_EXT, CHA_TAG_SIZE, AES_TAG_SIZE, HEADER_SIZE, SALT_SIZE, FILE_FORMAT_VERSION};
-use crate::common::{get_pass_bytes, key_derivation};
+use crate::common::KeyBuilder;
 use crate::common_io::{CryptIo, ReadInput, WriteFiles, WriteOutput};
 use crate::archive::ArchiveWrite;
+use crate::encryption::EncHeaderParams;
 
 
 /// Handles file decryption operations using dual-layer decryption and decompression.
@@ -24,51 +23,6 @@ use crate::archive::ArchiveWrite;
 pub struct Decryption;
 
 impl Decryption {
-    /// Hashes a user-provided password using Argon2 with supplied salt and optional key file.
-    ///
-    /// Derives a cryptographic key from the password using the provided salt, the optional key file,
-    /// and Argon2id algorithm, allowing recovery of the original key used for encryption.
-    ///
-    /// # Arguments
-    /// - `salt_pw`: Salt bytes to use for hashing
-    /// - `keyfilepath`: Optional path to an additional key file
-    ///
-    /// # Returns
-    /// - `Ok(key)` containing the derived key
-    /// - `Err` if password hashing or getting password/key file fails
-    fn hash_password(salt_pw: &[u8], keyfilepath: Option<&PathBuf>) -> Result<SecretSlice<u8>> {
-        let pass = get_pass_bytes(keyfilepath, false)?;
-
-        let mut key = SecretSlice::from(vec![0u8; KEY_SIZE]);
-        Argon2::default().hash_password_into(pass.expose_secret(), salt_pw, key.expose_secret_mut())
-            .map_err(|e| format!("Failed to hash password: {:?}", e))?;
-
-        Ok(key)
-    }
-
-    /// Derive ChaCha20 and AES keys from a master key and salts.
-    ///
-    /// Expands the provided master `key` with HKDF-SHA256 using `salt_cha` and
-    /// `salt_aes` to produce two independent 32‑byte keys.
-    ///
-    /// The function returns the derived keys wrapped in `SecretSlice<u8>` so
-    /// callers keep key material in secure containers.
-    ///
-    /// # Arguments
-    /// - `salt_cha`: salt for the ChaCha key derivation (expected length: `SALT_SIZE`)
-    /// - `salt_aes`: salt for the AES key derivation (expected length: `SALT_SIZE`)
-    /// - `key`: master secret material to expand (type: `SecretSlice<u8>`)
-    ///
-    /// # Returns
-    /// - `Ok((key_cha, key_aes))` — tuple of derived keys (`SecretSlice<u8>`) each `KEY_SIZE` bytes long
-    /// - `Err` if HKDF expansion or underlying operations fail
-    fn derive_keys(salt_cha: &[u8], salt_aes: &[u8], key: &SecretSlice<u8>) -> Result<(SecretSlice<u8>, SecretSlice<u8>)> {
-        let key_cha = key_derivation(key, salt_cha, "xchacha20poly1305".as_bytes())?;
-        let key_aes = key_derivation(key, salt_aes, "-aes-256-gcm-siv-".as_bytes())?;
-
-        Ok((key_cha, key_aes))
-    }
-
     /// Decrypts a buffer encrypted with XChaCha20-Poly1305 using the per‑chunk nonce modification.
     ///
     /// Extracts the nonce from the end of the buffer and decrypts the remainder.
@@ -302,92 +256,100 @@ impl Decryption {
         thread_handles
     }
 
-    /// Gets unencrypted data of header, i.e. the 3 salt values
+    /// Gets unencrypted data of header
     /// 
     /// # Argument:
     /// - `header`: header bytes
     /// 
     /// # Returns:
-    /// - `(salt_pw, salt_cha, salt_aes)`: salts for password, chacha key, aes key 
-    fn get_unencrypted_header_items(header: &[u8]) -> (&[u8], &[u8], &[u8]) {
-        let salt_pw  = &header[..SALT_SIZE];
-        let salt_cha = &header[SALT_SIZE..(2 * SALT_SIZE)];
-        let salt_aes = &header[(2 * SALT_SIZE)..(3 * SALT_SIZE)];
-
-        (salt_pw, salt_cha, salt_aes)
+    /// - `(salt_header_pw, salt_header_enc)`: salts for password, cha/aes keys
+    pub fn get_unencrypted_header_items(header_inout: &mut Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+        let salt_header_pw  = header_inout.drain(..SALT_SIZE).collect();
+        let salt_header_enc = header_inout.drain(..SALT_SIZE).collect();
+        (salt_header_pw, salt_header_enc)
     }
 
     /// Gets encrypted data of header
     /// 
     /// # Argument:
-    /// - `header`: header bytes
+    /// - `enc_header`: encrypted header bytes (without unencrypted bytes)
     /// - `cipher_cha`: cipher struct for chacha decryption
     /// - `cipher_aes`: cipher struct for aes decryption
     /// 
     /// # Returns:
-    /// - `Ok((file_format_version, compress, archive))` contains on success: version of file format, compression status, whether it's an archive 
-    fn get_encrypted_header_items(header: &[u8], cipher_cha: &XChaCha20Poly1305, cipher_aes: &Aes256GcmSiv) -> Result<(u8, bool, bool)> {
-        let mut enc_head = Vec::from(&header[(3 * SALT_SIZE)..HEADER_SIZE]);
+    /// - `Ok((file_format_version, enc_header_params))` contains on success: 
+    ///   version of file format, struct of encrypted header parameters
+    pub fn get_encrypted_header_items<'a>(enc_header: &'a mut Vec<u8>, cipher_cha: &XChaCha20Poly1305, cipher_aes: &Aes256GcmSiv) -> Result<(u8, EncHeaderParams<'a>)> {
+        Self::aes_decrypt_buffer(cipher_aes, enc_header)?;
+        Self::cha_decrypt_buffer(cipher_cha, enc_header, u32::MAX, false)?;
 
-        Self::aes_decrypt_buffer(cipher_aes, &mut enc_head)?;
-        Self::cha_decrypt_buffer(cipher_cha, &mut enc_head, u32::MAX, false)?;
+        // evaluate data
+        let file_format_version = enc_header[0];
+        let file_format         = enc_header[1];
 
-        // evaluate data, ignore random bytes
-        let file_format_version = enc_head[1];
-        let file_format         = enc_head[3];
         let compress = (file_format & 0x01) != 0;
         let archive  = (file_format & 0x02) != 0;
+        let keyfile  = (file_format & 0x04) != 0;
+        let usb_key  = (file_format & 0x08) != 0;
 
-        Ok((file_format_version, compress, archive))
+        let mut s = 2; 
+        let mut e = s + SALT_SIZE;
+        let salt_body_pw = &enc_header[s..e];
+        s = e; e += SALT_SIZE;
+        let salt_body_enc = &enc_header[s..e];
+
+        let mut salt_body_fido = None;
+        let mut credential_id_fido = None;
+        if usb_key {
+            s = e; e += SALT_SIZE;
+            salt_body_fido = Some(&enc_header[s..e]);
+
+            let credential_id_fido_len: usize = enc_header[e].into();
+            s = e + 1;
+            e = s + credential_id_fido_len;
+            credential_id_fido = Some(enc_header[s..e].to_vec());
+        }
+
+        let enc_header_params = EncHeaderParams {
+            salt_body_pw, 
+            salt_body_enc, 
+            salt_body_fido, 
+            credential_id_fido, 
+            compress, 
+            archive, 
+            keyfile, 
+            usb_key
+        };
+        Ok((file_format_version, enc_header_params))
     }
 
     /// Decrypts a file encrypted with dual-layer encryption (AES-256-GCM-SIV + ChaCha20).
     ///
-    /// Reads and evaluates header from file, prompts user for password, derives master key using Argon2,
-    /// derives keys for ChaCha20 and AES-256-GCM-SIV, decrypts the file in chunks across multiple threads. 
-    /// Output file has `.cce` suffix removed.
+    /// The input must end in `.cce` or `.c00` and contains:
+    /// - a short unencrypted header with salts for the password and header keys,
+    /// - an encrypted header that declares the body keys and file flags,
+    /// - the encrypted body stream, which may be compressed and/or archived.
     ///
+    /// The function validates the format version, derives the required keys from the
+    /// password and optional key material, decrypts the body in chunks, and writes the
+    /// result to the output directory or to a reconstructed file path. When compression
+    /// is enabled, it reassembles the compressed fragments and decompresses them before
+    /// writing.
+    /// 
     /// # Arguments
-    /// - `filepath_in`: Path to encrypted input file (must end with `.cce`)
-    /// - `dirpath_out`: Option path to an output directory
+    /// - `filepath_in`: Path to encrypted input file (must end with `.cce` or `.c00`)
+    /// - `dirpath_out`: Option path to an output directory. If `None`, the current working directory is used.
     /// - `keyfilepath`: Optional path to an additional key file
+    /// - `verbose`: Verbose output
+    /// - `list_archive`: List contents of archive
     ///
     /// # Returns
     /// - `Ok(())` on successful decryption
-    /// - `Err` if file operations, password handling, or decryption fails
+    /// - `Err` for invalid extensions, missing required key material, unsupported format versions, 
+    /// corrupted headers or payloads, and any I/O or write failure.
     pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, verbose: bool, list_archive: bool) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
-        }
-
-        // set read parameters
-        let mut read_input = Box:: new( ReadInput::new(
-            filepath_in, 
-            CHUNK_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE, 
-            HEADER_SIZE as u64
-        )? );
-
-        // Read file header
-        let mut header = [0u8; HEADER_SIZE];
-        read_input.read_files(&mut header)?;
-
-        // get salts from header
-        let (salt_pw, salt_cha, salt_aes) = Self::get_unencrypted_header_items(&header);
-
-        // get password and keys
-        let key = Self::hash_password(salt_pw, keyfilepath)?;
-        let (key_cha, key_aes) = Self::derive_keys(salt_cha, salt_aes, &key)?;
-        let cipher_cha = XChaCha20Poly1305::new_from_slice(key_cha.expose_secret())?;
-        let cipher_aes = Aes256GcmSiv::new_from_slice(key_aes.expose_secret())?;
-        
-        // get rest of header
-        let (file_format_version, compress, archive) = Self::get_encrypted_header_items(&header, &cipher_cha, &cipher_aes)?;
-
-        // check format version
-        if file_format_version != FILE_FORMAT_VERSION {
-            return Err(format!(
-                "This input file format (v{file_format_version}) cannot be decoded with this app version. It requires file format v{FILE_FORMAT_VERSION}."
-            ).into());
         }
 
         let mut filepath_out = PathBuf::from(filepath_in.file_name().unwrap());
@@ -399,11 +361,55 @@ impl Decryption {
             return Err(format!("Invalid filename, it does not end with .{ENCRYPTED_FILE_EXT} or .{SPLIT_ENC_FILE_EXT}").into())
         }
 
+        // set read parameters
+        let mut read_input = Box::new( 
+            ReadInput::new(
+                filepath_in, 
+                CHUNK_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE, 
+                HEADER_SIZE as u64
+            )? 
+        );
+
+        // read file header
+        let mut header = vec![0u8; HEADER_SIZE];
+        read_input.read_files(&mut header)?;
+
+        // get salts of first, unencrypted part of header
+        let (salt_header_pw, salt_header_enc) = Self::get_unencrypted_header_items(&mut header);
+
+        // get password and cipher structs for encrypted part of header
+        let mut key_builder = KeyBuilder::new(false);
+        let (cipher_header_cha, cipher_header_aes) = key_builder.get_password_and_create_header_ciphers(&salt_header_pw, &salt_header_enc)?;
+
+        // decrypt second part of header
+        let (file_format_version, enc_header_params) = Self::get_encrypted_header_items(&mut header, &cipher_header_cha, &cipher_header_aes)?;
+
+        // check format version
+        if file_format_version != FILE_FORMAT_VERSION {
+            return Err(format!(
+                "This input file format (v{file_format_version}) cannot be decoded with this app version. It requires file format v{FILE_FORMAT_VERSION}."
+            ).into());
+        }
+
+        // check if a keyfile is required and provided by user
+        if enc_header_params.keyfile && keyfilepath.is_none() {
+            return Err("Keyfile missing".into());
+        }
+
+        // check for usb key/FIFO authenticator
+        if let Some(cred_id_fifo) = enc_header_params.credential_id_fido {
+            // usb key was used
+            assert!(enc_header_params.usb_key && enc_header_params.salt_body_fido.is_some() && key_builder.credential_id_fido.is_none());
+            key_builder.credential_id_fido = Some(cred_id_fifo.to_vec());
+        }
+
+        let (cipher_body_cha, cipher_body_aes) = key_builder.create_body_ciphers(enc_header_params.salt_body_pw, enc_header_params.salt_body_enc, keyfilepath, enc_header_params.salt_body_fido)?;
+
         // use output directory path ot current working directory
         let output_dir =
         if let Some(dir_out) = dirpath_out {
             // create user-specified output directory, if it is not an archive or archive is not just listed (and directory is missing)
-            if ((archive && !list_archive) || !archive) && !dir_out.exists() {
+            if ((enc_header_params.archive && !list_archive) || !enc_header_params.archive) && !dir_out.exists() {
                 fs::create_dir_all(dir_out)?;
             }
             // canonicalize directory, as relative output path elements like ".." might not be resolved
@@ -422,10 +428,12 @@ impl Decryption {
         if verbose {
             println!("--------------------------");
             println!("File format version: {}", file_format_version);
-            println!("Compression:         {}", compress);
-            println!("Archive:             {}", archive);
+            println!("Keyfile:             {}", enc_header_params.keyfile);
+            println!("USB security key:    {}", enc_header_params.usb_key);
+            println!("Compression:         {}", enc_header_params.compress);
+            println!("Archive:             {}", enc_header_params.archive);
             println!("--------------------------");
-            if archive {
+            if enc_header_params.archive {
                 println!("Archive file is extracted to directory {}", output_dir.display());
             } else {
                 println!("Output is written to file {}", filepath_out.display());
@@ -433,7 +441,7 @@ impl Decryption {
         }
 
         // set write parameters and create output file
-        let write_output: Box<dyn WriteFiles + Send + 'static> = if archive {
+        let write_output: Box<dyn WriteFiles + Send + 'static> = if enc_header_params.archive {
             // convert relative path elements to absolute ones (looks better for verbose print)
             // in list mode, directory might not exist
             let dirpath_out_absolute = dirpath_out.map(|p| 
@@ -444,7 +452,7 @@ impl Decryption {
             Box::new( WriteOutput::new(filepath_out, vec![])? )
         };
 
-        CryptIo::io_chunks(&cipher_cha, &cipher_aes, compress, Self::decrypt_pipe, read_input, write_output)?;
+        CryptIo::io_chunks(&cipher_body_cha, &cipher_body_aes, enc_header_params.compress, Self::decrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }
@@ -459,82 +467,34 @@ impl Decryption {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use rand::Rng;
-    use crate::SALT_SIZE;
+    use std::path;
 
     #[test]
-    fn test_hash_password_decrypt() {
-        let salt = [1u8; SALT_SIZE];
-        // key should be the same for each call
-        let key1 = Decryption::hash_password(&salt ,None).unwrap();
-        let key2 = Decryption::hash_password(&salt, None).unwrap();
-        assert_eq!(key1.expose_secret(), key2.expose_secret());
-        // key should not be all zeros
-        assert_ne!(key1.expose_secret(), [0u8; KEY_SIZE]);
-
-        // key should change for the same salt, if a keyfile is added
-        let filepath_kf = PathBuf::from("test_pw_key.bin");
-        let mut data_kf = vec![0; 100];
-        rand::rng().fill_bytes(&mut data_kf);
-        fs::write(&filepath_kf, &data_kf).unwrap();
-        
-        let key3 = Decryption::hash_password(&salt, Some(&filepath_kf)).unwrap();
-        assert_ne!(key1.expose_secret(), key3.expose_secret());
-
-        // key file does not exist
-        assert!(Decryption::hash_password(&salt, Some(&PathBuf::from("test_miss"))).is_err());
-
-        // cleanup
-        let _ = fs::remove_file(&filepath_kf);
+    fn test_get_unencrypted_header_items() {
+        let hdr_org = [[1u8; SALT_SIZE], [2u8; SALT_SIZE], [3u8; SALT_SIZE]].concat();
+        let mut hdr = hdr_org.clone();
+        let (salt1, salt2) = Decryption::get_unencrypted_header_items(&mut hdr);
+        assert_eq!(hdr.len(), SALT_SIZE);
+        assert_eq!(salt1, hdr_org[..SALT_SIZE]);
+        assert_eq!(salt2, hdr_org[SALT_SIZE..2 * SALT_SIZE]);
+        assert_eq!(hdr, hdr_org[2 * SALT_SIZE..])
     }
 
     #[test]
-    fn test_derive_keys_decrypt() {
-        let key: [u8; 32] = rand::random();
-        let key_sec = SecretSlice::from(key.to_vec());
-        let salt_cha: [u8; SALT_SIZE] = rand::random();
-        let salt_aes: [u8; SALT_SIZE] = rand::random();
+    fn test_decrypt() {
+        // most tests are done together with encryption test
 
-        let (key_cha, key_aes) = Decryption::derive_keys(&salt_cha, &salt_aes, &key_sec).unwrap();
+        // file for decryption is too small
+        let filepath_in = path::absolute(PathBuf::from("test_dec.cce")).unwrap();
+        let data = vec![0xa5; HEADER_SIZE + CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE - 1];
+        fs::write(&filepath_in, &data).unwrap();
+        assert!(Decryption::decrypt(&filepath_in, None, None, false, false).is_err());
 
-        // Output should have correct sizes
-        assert_eq!(key_cha.expose_secret().len(), KEY_SIZE);
-        assert_eq!(key_aes.expose_secret().len(), KEY_SIZE);
-        
-        // Keys should not be all zeros
-        assert_ne!(key_cha.expose_secret(), [0u8; KEY_SIZE]);
-        assert_ne!(key_aes.expose_secret(), [0u8; KEY_SIZE]);
-        
-        // ChaCha and AES keys should be different from each other
-        assert_ne!(key_cha.expose_secret(), key_aes.expose_secret());
+        // empty .cce-file
+        fs::write(&filepath_in, []).unwrap();
+        assert!(Decryption::decrypt(&filepath_in, None, None, false, false).is_err());
 
-        // Same inputs should produce identical outputs
-        let (key_cha2, key_aes2) = Decryption::derive_keys(&salt_cha, &salt_aes, &key_sec).unwrap();
-        assert_eq!(key_cha.expose_secret(), key_cha2.expose_secret());
-        assert_eq!(key_aes.expose_secret(), key_aes2.expose_secret());
-
-        // Different ChaCha salt
-        let mut salt_cha2 = salt_cha;
-        salt_cha2[0] ^= 0xFF;
-        let (key_cha3, key_aes3) = Decryption::derive_keys(&salt_cha2, &salt_aes, &key_sec).unwrap();
-        assert_ne!(key_cha.expose_secret(), key_cha3.expose_secret());
-        assert_eq!(key_aes.expose_secret(), key_aes3.expose_secret());
-
-        // Different AES salt
-        let mut salt_aes4 = salt_aes;
-        salt_aes4[0] ^= 0xFF;
-        let (key_cha4, key_aes4) = Decryption::derive_keys(&salt_cha, &salt_aes4, &key_sec).unwrap();
-        assert_eq!(key_cha.expose_secret(), key_cha4.expose_secret());
-        assert_ne!(key_aes.expose_secret(), key_aes4.expose_secret());
-
-        // Different input key
-        let mut key2 = key;
-        key2[0] ^= 0xFF;
-        let key_sec2 = SecretSlice::from(key2.to_vec());
-        let (key_cha5, key_aes5) = Decryption::derive_keys(&salt_cha, &salt_aes, &key_sec2).unwrap();
-        assert_ne!(key_cha.expose_secret(), key_cha5.expose_secret());
-        assert_ne!(key_aes.expose_secret(), key_aes5.expose_secret());
-
+        // cleanup
+        let _ = fs::remove_file(&filepath_in);
     }
 }

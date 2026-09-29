@@ -26,6 +26,10 @@ struct Args {
     #[arg(short, long)]
     keyfile: Option<PathBuf>,
 
+    /// Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
+    #[arg(short, long)]
+    usb_key: bool,
+
     /// Compress data before encryption, automatically detected on decryption
     #[arg(short = 'z', long, default_value_t = false)]
     compress: bool,
@@ -79,7 +83,7 @@ fn run() -> Result<()> {
     if args.decrypt {
         Decryption::decrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.verbose, args.list_archive)?;
     } else {
-        Encryption::encrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.compress, args.split, args.verbose)?;
+        Encryption::encrypt(&filepath, output_dir.as_ref(), keyfilepath.as_ref(), args.usb_key, args.compress, args.split, args.verbose)?;
     }
 
     Ok(())

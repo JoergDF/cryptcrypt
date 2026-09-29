@@ -71,7 +71,7 @@ impl ReadInput {
         
         if f_in_header_size != 0 
         && f_in_total_size < f_in_header_size + (CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE) as u64 {
-            return Err("File cannot be decoded".into());
+            return Err("File cannot be decrypted".into());
         }
 
         // header was already read, therefore remaining file size must be reduced by the header's size
