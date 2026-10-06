@@ -9,10 +9,10 @@ use aes_gcm_siv::{Aes256GcmSiv, AeadInOut, Nonce};
 use bzip2::read::BzDecoder;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
-use crate::{Result, CHA_NONCE_SIZE, AES_NONCE_SIZE, CHUNK_SIZE, COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT,
+use crate::{Result, CHA_NONCE_SIZE, AES_NONCE_SIZE, CHUNK_SIZE, FILE_ID_SIZE, COMPRESS_LENGTH_SIZE, ENCRYPTED_FILE_EXT,
             SPLIT_ENC_FILE_EXT, CHA_TAG_SIZE, AES_TAG_SIZE, HEADER_SIZE, SALT_SIZE, FILE_FORMAT_VERSION};
 use crate::common::KeyBuilder;
-use crate::common_io::{CryptIo, ReadInput, WriteFiles, WriteOutput};
+use crate::common_io::{CryptIo, CryptConfig, ReadInput, WriteFiles, WriteOutput};
 use crate::archive::ArchiveWrite;
 use crate::encryption::EncHeaderParams;
 
@@ -30,17 +30,23 @@ impl Decryption {
     /// The function reconstructs the modified nonce by XOR'ing:
     /// - `nonce[0]` with `final_chunk`, and
     /// - `nonce[1..]` with the little‑endian bytes of `chunk_count` (applied starting at index 1).
+    ///
+    /// The authenticated `associated_data` for a chunk is built from the file format
+    /// version, a characterizing string, and a caller-provided array.
+    /// This value must match the metadata used during encryption or authentication will fail.
     /// 
     /// # Arguments
     /// - `cipher`: XChaCha20-Poly1305 cipher struct initialized with key.
     /// - `buf_inout`: data-in: ciphertext (+ authentication tag) + nonce; data-out: decrypted data.
     /// - `chunk_count`: zero‑based chunk index; must match the value used during encryption.
     /// - `final_chunk`: `true` if this is the last chunk; must match the value used during encryption.
-    ///
+    /// - `more_associated_data`: Additional per-file metadata folded into the
+    ///   authenticated `associated_data` for this chunk; must match the value used during encryption.
+    /// 
     /// # Returns
     /// - `Ok()` on successful decryption
     /// - `Err` if decryption fails or authentication tag verification fails
-    pub fn cha_decrypt_buffer(cipher: &XChaCha20Poly1305, buf_inout: &mut Vec<u8>, chunk_count: u32, final_chunk: bool) -> Result<()> {
+    pub fn cha_decrypt_buffer(cipher: &XChaCha20Poly1305, buf_inout: &mut Vec<u8>, chunk_count: u32, final_chunk: bool, more_associated_data: &[u8]) -> Result<()> {
         let nonce_pos = buf_inout.len() - CHA_NONCE_SIZE;
         let mut nonce = XNonce::try_from(&buf_inout[nonce_pos..])?;
         
@@ -50,7 +56,12 @@ impl Decryption {
             nonce[i+1] ^= ccb;
         }
         buf_inout.truncate(nonce_pos);
-        cipher.decrypt_in_place(&nonce, &[], buf_inout)
+
+        let mut associated_data = vec![FILE_FORMAT_VERSION];
+        associated_data.extend("Cha".as_bytes());
+        associated_data.extend(more_associated_data);
+
+        cipher.decrypt_in_place(&nonce, &associated_data, buf_inout)
             .map_err(|_e| "Failed to decrypt data!")?; // for better user info
         Ok(())
     }
@@ -60,18 +71,34 @@ impl Decryption {
     /// Extracts the nonce from the end of the buffer and decrypts the remainder.
     /// Verifies authentication tag during decryption.
     ///
+    /// The authenticated `associated_data` for an chunk is built from the file format
+    /// version, characterizing string, and a caller-provided array, the little-endian bytes 
+    /// of `chunk_count`, and the `final_chunk` flag. This value must match the metadata used 
+    /// during encryption or authentication will fail.
+    /// 
     /// # Arguments
     /// - `cipher`: Aes256GcmSiv cipher struct initialized with key
     /// - `buf_inout`: data-in: ciphertext (+ authentication tag) + nonce; data-out: decrypted data
-    ///
+    /// - `chunk_count`: zero‑based chunk index; must match the value used during encryption.
+    /// - `final_chunk`: `true` if this is the last chunk; must match the value used during encryption.
+    /// - `more_associated_data`: Additional per-file metadata folded into the
+    ///   authenticated `associated_data` for this chunk; must match the value used during encryption.
+    /// 
     /// # Returns
     /// - `Ok()` on successful decryption
     /// - `Err` if decryption fails or authentication tag verification fails
-    pub fn aes_decrypt_buffer(cipher: &Aes256GcmSiv, buf_inout: &mut Vec<u8>) -> Result<()> {
+    pub fn aes_decrypt_buffer(cipher: &Aes256GcmSiv, buf_inout: &mut Vec<u8>, chunk_count: u32, final_chunk: bool, more_associated_data: &[u8]) -> Result<()> {
         let nonce_pos = buf_inout.len() - AES_NONCE_SIZE;
         let nonce = Nonce::try_from(&buf_inout[nonce_pos..])?;
         buf_inout.truncate(nonce_pos);
-        cipher.decrypt_in_place(&nonce, &[], buf_inout)
+
+        let mut associated_data = vec![FILE_FORMAT_VERSION];
+        associated_data.extend("Aes".as_bytes());
+        associated_data.extend(more_associated_data);
+        associated_data.extend(chunk_count.to_le_bytes());
+        associated_data.push(u8::from(final_chunk));
+
+        cipher.decrypt_in_place(&nonce, &associated_data, buf_inout)
             .map_err(|_e| "Failed to decrypt data!")?; // for better user info
         Ok(())
     }
@@ -159,35 +186,38 @@ impl Decryption {
         Ok(())
     }
    
-    /// Creates the multithreaded decryption pipeline and returns thread handles.
+    /// Creates the multithreaded decryption pipeline and returns all worker handles.
     ///
-    /// Spawns worker threads to reverse the encryption pipeline and produce plaintext chunks
-    /// for writing. Behavior depends on `decompress`:
-    /// - Always spawns `cpu_count` decryption threads: each reads `(Vec<u8>, chunk_count, final_flag)`
-    ///   from `rx_in`, performs AES-256-GCM-SIV decryption, then XChaCha20-Poly1305 decryption
-    ///   (reconstructing per-chunk nonce using `chunk_count` and `final_flag`), and sends
-    ///   `(Vec<u8>, chunk_count)`.
-    /// - If `decompress == true`:
-    ///   - Spawns a single re-segmentation thread that reads ordered decrypted inner payloads,
-    ///     stitches and parses length-prefixed compressed entries, and forwards `(Vec<u8>, u32)`
-    ///     to the decompression channel.
-    ///   - Spawns `cpu_count` decompression threads that read `(Vec<u8>, chunk_count)` from the
-    ///     re-segmentation output, decompress each entry, and send `(Vec<u8>, chunk_count)` to `tx_out`.
+    /// Incoming encrypted chunks are read from `rx_in` and processed in reverse order to
+    /// the encryption pipeline. The function always starts decryption workers first. When
+    /// compression is enabled, the decrypted inner payloads are reassembled,
+    /// length-prefixed compressed fragments are extracted, and the recovered entries are
+    /// decompressed before they are forwarded to `tx_out`.
+    ///
+    /// The exact behavior is:
+    /// - allocate `cpu_count` decryption workers when compression is off,
+    ///   or `max(1, cpu_count - c_thread_cnt)` workers when compression is on
+    /// - each decryption worker reads `(Vec<u8>, u32, bool)` from `rx_in`, runs
+    ///   AES-256-GCM-SIV and XChaCha20-Poly1305 decryption in sequence, and sends the
+    ///   decrypted chunk as `(Vec<u8>, u32)` to either `tx_out` directly or to an internal
+    ///   resegmentation channel if compression is active
+    /// - when compression is enabled, a single resegmentation thread consumes the
+    ///   decrypted chunks, concatenates them, reconstructs the length-prefixed compressed
+    ///   entries, and sends each extracted payload as `(Vec<u8>, u32)` onward
+    /// - decompression workers then call `decompress_buffer` and emit the final plaintext
+    ///   chunks `(Vec<u8>, u32)` to `tx_out`
     ///
     /// # Arguments
-    /// - `cipher_cha`: cipher struct for XChaCha20-Poly1305 decryption
-    /// - `cipher_aes`: cipher struct for AES-256-GCM-SIV decryption
-    /// - `decompress`: enable resegment + decompression stages when true.
-    /// - `rx_in`: receiver for encrypted input chunks `(data, chunk_count, final_flag)`.
-    /// - `tx_out`: sender for final plaintext output `(plaintext_chunk, chunk_count)`.
-    /// - `cpu_count`: number of worker threads to spawn.
+    /// - `crypt_cfg`: Shared configuration containing the ciphers and the compression flag.
+    /// - `rx_in`: Receiver of encrypted chunks as `(Vec<u8>, chunk_count, final_chunk)`.
+    /// - `tx_out`: Sender for final plaintext chunks as `(Vec<u8>, chunk_count)`.
+    /// - `cpu_count`: Number of logical CPU cores used to size the worker pool.
     ///
     /// # Returns
-    /// - `Vec<thread::JoinHandle<std::result::Result<(), String>>>` — handles for all spawned threads.
+    /// - `Vec<thread::JoinHandle<Result<(), String>>>` containing the decryption,
+    ///   resegmentation, and decompression worker handles.
     pub fn decrypt_pipe(
-        cipher_cha: &XChaCha20Poly1305, 
-        cipher_aes: &Aes256GcmSiv,
-        decompress: bool, 
+        crypt_cfg: &CryptConfig,
         rx_in: Receiver<(Vec<u8>, u32, bool)>, 
         tx_out: Sender<(Vec<u8>, u32)>, 
         cpu_count: usize
@@ -196,7 +226,7 @@ impl Decryption {
         // number of threads used for decryption and decompression
         let c_thread_cnt;
         let e_thread_cnt;
-        if decompress {
+        if crypt_cfg.compress {
             c_thread_cnt = 1.max(cpu_count * 8 / 10);
             e_thread_cnt = 1.max(cpu_count - c_thread_cnt);
         } else {
@@ -210,22 +240,25 @@ impl Decryption {
 
         // decryption threads
         for _ in 0..e_thread_cnt {
-            let cipher_cha= cipher_cha.clone();
-            let cipher_aes = cipher_aes.clone();
+            let cipher_cha= crypt_cfg.cipher_cha.clone();
+            let cipher_aes = crypt_cfg.cipher_aes.clone();
+            let more_associated_data = crypt_cfg.more_associated_data.clone();
             let rx_in = rx_in.clone();
-            let tx_e = if decompress { tx_e.clone() } else { tx_out.clone() };
+            let tx_e = if crypt_cfg.compress { tx_e.clone() } else { tx_out.clone() };
 
             thread_handles.push(thread::spawn( move || -> std::result::Result<(), String> { 
                 for (mut buf_inout, chunk_count, final_chunk) in rx_in {
-                    Self::aes_decrypt_buffer(&cipher_aes, &mut buf_inout).map_err(|e| e.to_string())?;
-                    Self::cha_decrypt_buffer(&cipher_cha, &mut buf_inout, chunk_count, final_chunk).map_err(|e| e.to_string())?;
+                    Self::aes_decrypt_buffer(&cipher_aes, &mut buf_inout, chunk_count, final_chunk, &more_associated_data)
+                        .map_err(|e| e.to_string())?;
+                    Self::cha_decrypt_buffer(&cipher_cha, &mut buf_inout, chunk_count, final_chunk, &more_associated_data)
+                        .map_err(|e| e.to_string())?;
                     if tx_e.send((buf_inout, chunk_count)).is_err() { break }
                 }
                 Ok(())
             }));
         }
 
-        if decompress {
+        if crypt_cfg.compress {
             let (tx_c, rx_c) = bounded(cpu_count * 2);
 
             // re-segmentation thread
@@ -280,8 +313,8 @@ impl Decryption {
     /// - `Ok((file_format_version, enc_header_params))` contains on success: 
     ///   version of file format, struct of encrypted header parameters
     pub fn get_encrypted_header_items<'a>(enc_header: &'a mut Vec<u8>, cipher_cha: &XChaCha20Poly1305, cipher_aes: &Aes256GcmSiv) -> Result<(u8, EncHeaderParams<'a>)> {
-        Self::aes_decrypt_buffer(cipher_aes, enc_header)?;
-        Self::cha_decrypt_buffer(cipher_cha, enc_header, u32::MAX, false)?;
+        Self::aes_decrypt_buffer(cipher_aes, enc_header, u32::MAX, true, "header_aes".as_bytes())?;
+        Self::cha_decrypt_buffer(cipher_cha, enc_header, 0, false, "header_cha".as_bytes())?;
 
         // evaluate data
         let file_format_version = enc_header[0];
@@ -297,6 +330,8 @@ impl Decryption {
         let salt_body_pw = &enc_header[s..e];
         s = e; e += SALT_SIZE;
         let salt_body_enc = &enc_header[s..e];
+         s = e; e += FILE_ID_SIZE;
+        let file_id = &enc_header[s..e];
 
         let mut salt_body_fido = None;
         let mut credential_id_fido = None;
@@ -312,7 +347,8 @@ impl Decryption {
 
         let enc_header_params = EncHeaderParams {
             salt_body_pw, 
-            salt_body_enc, 
+            salt_body_enc,
+            file_id,
             salt_body_fido, 
             credential_id_fido, 
             compress, 
@@ -346,7 +382,7 @@ impl Decryption {
     /// # Returns
     /// - `Ok(())` on successful decryption
     /// - `Err` for invalid extensions, missing required key material, unsupported format versions, 
-    /// corrupted headers or payloads, and any I/O or write failure.
+    ///   corrupted headers or payloads, and any I/O or write failure.
     pub fn decrypt(filepath_in: &PathBuf, dirpath_out: Option<&PathBuf>, keyfilepath: Option<&PathBuf>, verbose: bool, list_archive: bool) -> Result<()> {
         if filepath_in.is_dir() {
             return Err("Cannot decrypt a directory".into());
@@ -452,7 +488,13 @@ impl Decryption {
             Box::new( WriteOutput::new(filepath_out, vec![])? )
         };
 
-        CryptIo::io_chunks(&cipher_body_cha, &cipher_body_aes, enc_header_params.compress, Self::decrypt_pipe, read_input, write_output)?;
+        let crypt_cfg = CryptConfig {
+            cipher_cha: cipher_body_cha, 
+            cipher_aes: cipher_body_aes, 
+            compress: enc_header_params.compress, 
+            more_associated_data: enc_header_params.file_id.to_vec()
+        }; 
+        CryptIo::io_chunks(&crypt_cfg, Self::decrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }

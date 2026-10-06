@@ -1,7 +1,8 @@
 # cryptcrypt
 
 A command-line tool for encrypting and decrypting a file or a directory using modern encryption algorithms and password-based key derivation.
-Additionally, it can use a key file, bzip2 compression and an output file split. The contents of a directory are concatenated into an archive.
+Additionally, it can use a USB security key, a key file, bzip2 compression and an output file split. The contents of a directory are 
+concatenated into an archive.
 
 **Security Notes**: This software is experimental. There wasn't any security audit. Do not use in production. USE AT YOUR OWN RISK!
 
@@ -9,7 +10,8 @@ Additionally, it can use a key file, bzip2 compression and an output file split.
 
 - Dual encryption with ciphers AES-GCM-SIV and XChaCha20Poly1305
 - Password-based key derivation (Argon2id)
-- Optional key file can be used additionally to the password
+- Optional USB security key / FIDO authenticator to supplement the password
+- Optional key file (its first 64 MB) can be used additionally to the password
 - Optional bzip2 compression before encryption
 - Optional split of output into files of user-defined number and size
 - Handles large files efficiently by parallel processing them in chunks
@@ -26,6 +28,15 @@ Additionally, it can use a key file, bzip2 compression and an output file split.
 - File permissions: only on Unix-like systems (MacOS, Linux)
 - Stores relative paths
 - Building an archive (i.e. reading files) is done in parallel for improved performance
+
+### USB security key
+- FIDO2 authenticator
+- PIN must be set on device and need to be entered by user
+- Non-discoverable (non-resident) credentials
+- Hmac-secret
+- Tested with Token2 PIN+ Release3.3  
+
+An encrypted file can be bound to only one USB security key. If you want to protect data against hardware failure of USB security key, you should encrypt the data again with another USB security key.
 
 ## Usage
 
@@ -44,6 +55,7 @@ Options:
   -o, --out-dir <OUT_DIR>  Output directory, it is created if it does not exist
   -d, --decrypt            Decrypt file (with extension '.cce' or for split series '.c00')
   -k, --keyfile <KEYFILE>  Additional key file to supplement the password
+  -u, --usb-key            Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
   -z, --compress           Compress data before encryption, automatically detected on decryption
   -s, --split <SPLIT>      Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
   -l, --list-archive       List elements of an archive file, do not create its elements
@@ -94,21 +106,29 @@ cargo run --release
 
 ## Encryption details
 
-1. If a key file is used, hash its first 64 MByte (maximum) with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3).
-2. Derive encryption key from password and the optional key file hash using [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2) with a random salt. Write the salt to the output file.
-3. From the master key derive two independent 32‑byte keys: one for XChaCha20-Poly1305 and one for AES-256-GCM-SIV. 
-Each key is derived with [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf) using its own fresh random salt. 
-Write the ChaCha salt then the AES salt immediately after the password salt.
-4. Encrypt and write file format version and file format (i.e. compression and archive status) to the output file. (file header: password salt, ChaCha salt, AES salt, encrypted file format version, encrypted file format).
-5. Read a 1 MByte chunk from the input file (the last chunk may be smaller). Keep a zero-based sequence number for each chunk and mark the final chunk with a flag.
-6. If compression is switched on, compress chunk with [bzip2](https://github.com/trifectatechfoundation/bzip2-rs). Its variably sized output is copied to fixed sized, 1 MB chunks. The chunk size should not give a hint about the cleartext.
-7. First-pass encrypt the chunk with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) 
-using a fresh random base nonce generated per chunk. For the actual encryption nonce the implementation derives a per-chunk nonce 
-by XOR’ing the base nonce with the chunk’s sequence number and the final-chunk flag; the original base nonce is stored after the 
-ChaCha ciphertext so the per-chunk nonce can be recomputed during decryption. Reordering or truncating the chunk sequence would cause a decryption error.
-8. Second-pass encrypt the output of step 7 with [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) 
-using a fresh random nonce; the AES nonce is stored after the AES ciphertext and written to the (split) output file.
-9. Repeat steps 5–8 until all input is processed.
+The header of an encrypted file consists of an unencrypted part and an encrypted part:
+
+1. **Unencrypted header part:**  
+   It contains two salts used to encrypt the second part of the header: 
+   * A random salt used to create a key from the password with [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2).
+   * A different random salt used to derive two keys from that password-derived key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf). These two final keys are used to encrypt the second header part with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) and [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv).
+
+2. **Encrypted header part:**  
+   It contains two new salts used to encrypt the file body and additional metadata:
+   * A random salt where the inputs to [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2) for generating a primary key are: the password, an optional USB security key's hmac-secret, and an optional key file hash.
+   * Another random salt used to derive two keys from the primary key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf). 
+   These two keys are used to encrypt the file's body with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) and [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv).  
+   
+   If a key file is used, its first 64 MB (maximum) is hashed with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3). If a USB security key is used, a credential ID and a random salt are stored and used to retrieve an hmac-secret from the key; otherwise, their space is filled with random data. Additionally, the following data and flags are saved: the file format version, and flags indicating whether compression, an archive, a key file, or a USB security key is used. The overall header length remains constant regardless of which options are selected.
+
+The encryption of the file's body follows this procedure:
+
+1. Read a 1 MB chunk from the input file (the last chunk may be smaller). Keep a zero-based sequence number for each chunk and mark the final chunk with a flag.
+2. If compression is enabled, compress the chunk using [bzip2](https://github.com/trifectatechfoundation/bzip2-rs). Its variable-sized output is copied into fixed-size, 1 MB chunks. (The chunk size should not leak information about the cleartext.)
+3. **First-pass encryption:** Encrypt the chunk with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using a fresh random base nonce generated per chunk. The implementation derives the actual encryption nonce by XOR'ing the base nonce with the chunk's sequence number and the final-chunk flag. The original base nonce is stored after the ChaCha ciphertext so the per-chunk nonce can be recomputed during decryption. Reordering or truncating the chunk sequence causes a decryption error. Additional associated data (AAD) used for authentication includes: the file format version, the string "Cha", and the file ID.
+4. **Second-pass encryption:** Encrypt the output of step 3 with [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a fresh random nonce. AAD contains: the file format version, the string "Aes", the file ID, the chunk count, and the final flag. The AES nonce is stored after the AES ciphertext and written to the output file.
+5. Repeat steps 1 through 4 until all input is processed.
+
 
 ## License
 
