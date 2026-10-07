@@ -282,8 +282,8 @@ impl Encryption {
     ///   packetizes compressed fragments using the length-prefix scheme, and emits
     ///   the resulting `(Vec<u8>, u32, bool)` stream into the encryption channel
     /// - every encryption worker reads from that channel, encrypts the data with
-    ///  XChaCha20-Poly1305 encryption, then runs AES-256-GCM-SIV on the result before
-    ///  sending the final payload to `tx_out`
+    ///   XChaCha20-Poly1305 encryption, then runs AES-256-GCM-SIV on the result before
+    ///   sending the final payload to `tx_out`
     ///
     /// When compression is disabled, all worker slots are used for encryption and
     /// each thread reads directly from `rx_in`.

@@ -20,6 +20,7 @@ use ctap_hid_fido2::{
 
 use crate::{Result, CHUNK_SIZE, MAX_KEYFILE_CHUNKS, KEY_SIZE, SALT_SIZE};
 
+
 /// Creates file encryption/decryption ciphers.
 #[derive(Default)]
 pub struct KeyBuilder {
@@ -27,6 +28,8 @@ pub struct KeyBuilder {
     verify_password: bool,
     /// Password retained between header and body cipher creation.
     password: SecretString,
+    /// Argon2 cost parameters used for password hashing
+    argon2_params: argon2::Params,
     /// FIDO2 credential ID used to request the authenticator's hmac-secret.
     pub credential_id_fido: Option<Vec<u8>>,
 }
@@ -34,7 +37,14 @@ pub struct KeyBuilder {
 impl KeyBuilder {
     pub fn new(verify_password: bool) -> Self {
         let it = Self::default();
-        Self { verify_password, ..it }
+        let argon2_params = if cfg!(test) || cfg!(fuzzing) {
+            // Argon2 costs: default, faster for testing
+            argon2::Params::default()
+        } else {
+            // Argon2 costs: memory: 2 GB, number of passes: 2, degree of parallelism: 1
+            argon2::Params::new(2_097_152, 2, 1 , Some(KEY_SIZE)).unwrap()
+        };
+        Self { verify_password, argon2_params, ..it }
     }
 
     /// Prompts the user to enter a password from the terminal.
@@ -272,7 +282,8 @@ impl KeyBuilder {
         self.password = Self::get_password_from_user(self.verify_password)?;
 
         let mut key = SecretSlice::from(vec![0u8; KEY_SIZE]);
-        Argon2::default().hash_password_into(self.password.expose_secret().as_bytes(), salt_pw, key.expose_secret_mut())
+        let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::default(), self.argon2_params.clone());
+        argon.hash_password_into(self.password.expose_secret().as_bytes(), salt_pw, key.expose_secret_mut())
             .map_err(|_e| "Failed to hash password")?;
 
         let key_cha = Self::key_derivation(&key, salt_enc, "header-xchacha20poly1305".as_bytes())?;
@@ -322,8 +333,8 @@ impl KeyBuilder {
         pwd.extend(self.password.expose_secret().as_bytes());
 
         let mut key = SecretSlice::from(vec![0u8; KEY_SIZE]);
-        Argon2::default().hash_password_into(&pwd, salt_pw, key.expose_secret_mut())
-            .map_err(|_e| "Failed to hash password")?;
+        let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::default(), self.argon2_params.clone());
+        argon.hash_password_into(&pwd, salt_pw, key.expose_secret_mut()).map_err(|_e| "Failed to hash password")?;
         pwd.zeroize();
         self.password.zeroize();
 
