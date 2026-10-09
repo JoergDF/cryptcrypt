@@ -6,10 +6,11 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretSlice, SecretString};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, Zeroizing, ZeroizeOnDrop};
 use argon2::Argon2;
 use chacha20poly1305::XChaCha20Poly1305;
-use aes_gcm_siv::{Aes256GcmSiv, aead::KeyInit};
+use aes_gcm_siv::{Aes256GcmSiv, Nonce, KeySizeUser, aead::{Aead, Generate, Key, KeyInit}};
+use typenum::Unsigned;
 use ctap_hid_fido2::{
     fidokey::{
         get_info::{InfoParam, InfoOption}, 
@@ -18,16 +19,68 @@ use ctap_hid_fido2::{
     Cfg, FidoKeyHidFactory, verifier
 };
 
-use crate::{Result, CHUNK_SIZE, MAX_KEYFILE_CHUNKS, KEY_SIZE, SALT_SIZE};
+use crate::{Result, CHUNK_SIZE, MAX_KEYFILE_CHUNKS, KEY_SIZE};
 
+
+/// Encrypted in-memory storage for secret data.
+///
+/// Keeps plaintext out of memory as long as possible by storing it
+/// in an encrypted buffer and zeroizing sensitive data on drop.
+#[derive(Default, Zeroize, ZeroizeOnDrop)]
+struct CryptMemory {
+    /// Key used to encrypt and decrypt the stored payload.
+    key: [u8; <Aes256GcmSiv as KeySizeUser>::KeySize::USIZE],
+    /// Nonce used for the authenticated encryption operation.
+    nonce: Nonce,
+    /// Ciphertext produced from the original plaintext buffer.
+    data: Vec<u8>,
+    /// Original length of the plaintext before encryption.
+    cleartext_len: usize,
+}
+
+impl CryptMemory {
+    /// Creates a new encrypted in-memory secret from the provided plaintext bytes.
+    ///
+    /// A fresh random key and nonce are generated for each instance, and the
+    /// plaintext is encrypted before it is stored in memory.
+    ///
+    /// # Arguments
+    /// - `buf_in`: Plaintext bytes to encrypt and store in memory.
+    ///
+    /// # Returns
+    /// - `Ok(Self)` containing an encrypted in-memory representation of the input
+    /// - `Err` if encryption fails
+    fn new(buf_in: &[u8]) -> Result<Self> {
+        let cleartext_len = buf_in.len();
+        let key = Key::<Aes256GcmSiv>::generate();
+        let cipher = Aes256GcmSiv::new(&key);
+        let nonce = Nonce::generate();
+        let data = cipher.encrypt(&nonce, buf_in)?;
+        Ok( Self{key: key.into(), nonce, data, cleartext_len} )
+    }
+
+    /// Decrypts the stored ciphertext and returns the original plaintext bytes.
+    ///
+    /// This method authenticates and decrypts the payload using the internally
+    /// stored key and nonce.
+    ///
+    /// # Returns
+    /// - `Ok(buf_out)` containing the original decrypted bytes
+    /// - `Err` if authentication or decryption fails
+    fn decrypt(&mut self) -> Result<Vec<u8>> {
+        let cipher = Aes256GcmSiv::new_from_slice(&self.key)?;
+        let buf_out = cipher.decrypt(&self.nonce, self.data.as_slice())?;
+        Ok(buf_out)
+    }
+}
 
 /// Creates file encryption/decryption ciphers.
 #[derive(Default)]
 pub struct KeyBuilder {
     /// Whether the password should be entered twice for confirmation.
     verify_password: bool,
-    /// Password retained between header and body cipher creation.
-    password: SecretString,
+    /// Encrypted password retained between header and body cipher creation.
+    password: CryptMemory,
     /// Argon2 cost parameters used for password hashing
     argon2_params: argon2::Params,
     /// FIDO2 credential ID used to request the authenticator's hmac-secret.
@@ -38,7 +91,7 @@ impl KeyBuilder {
     pub fn new(verify_password: bool) -> Self {
         let it = Self::default();
         let argon2_params = if cfg!(test) || cfg!(fuzzing) {
-            // Argon2 costs: default, faster for testing
+            // Argon2 costs: default, faster, for testing
             argon2::Params::default()
         } else {
             // Argon2 costs: memory: 2 GB, number of passes: 2, degree of parallelism: 1
@@ -51,15 +104,12 @@ impl KeyBuilder {
     ///
     /// In test mode, returns a hardcoded test password. In normal mode, reads a password
     /// from user input, optionally verifying it matches a repeated entry.
-    ///
-    /// # Arguments
-    /// - `verify`: If `true`, prompts the user to repeat the password and verifies they match.
-    ///   If `false`, only prompts once.
+    /// Password is encrypted, so it is harder to get it with a memory dump. If a USB security key is used, 
+    /// the password would otherwise stay in memory for quite a long time as cleartext.
     ///
     /// # Returns
-    /// - `Ok(password)` containing the user's password
-    /// - `Err` if passwords don't match (when verify=true) or on I/O error
-    fn get_password_from_user(verify: bool) -> Result<SecretString> {
+    /// - `Err` if passwords don't match (when verify=true), I/O error or encryption error
+    fn get_password_from_user(&mut self) -> Result<()> {
         let password = SecretString::from(
             if cfg!(test) || cfg!(fuzzing) {
                 if !cfg!(fuzzing) { println!("!!! Test-password used !!!"); }
@@ -69,7 +119,7 @@ impl KeyBuilder {
             }
         );
 
-        if verify {
+        if self.verify_password {
             let password_rep = SecretString::from( 
                 if cfg!(test) || cfg!(fuzzing) {
                     "abc123test".to_string()
@@ -83,7 +133,9 @@ impl KeyBuilder {
             }
         }
 
-        Ok(password)
+        self.password = CryptMemory::new(password.expose_secret().as_bytes())?;
+        
+        Ok(())
     }
 
     /// Prompts the user to enter a PIN for the USB security key from the terminal.
@@ -279,11 +331,11 @@ impl KeyBuilder {
     /// - `Err` if password input, password hashing, key derivation, or cipher
     ///   initialization fails
     pub fn get_password_and_create_header_ciphers(&mut self, salt_pw: &[u8], salt_enc: &[u8]) -> Result<(XChaCha20Poly1305, Aes256GcmSiv)> {
-        self.password = Self::get_password_from_user(self.verify_password)?;
+        self.get_password_from_user()?;
 
         let mut key = SecretSlice::from(vec![0u8; KEY_SIZE]);
         let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::default(), self.argon2_params.clone());
-        argon.hash_password_into(self.password.expose_secret().as_bytes(), salt_pw, key.expose_secret_mut())
+        argon.hash_password_into(&self.password.decrypt()?, salt_pw, key.expose_secret_mut())
             .map_err(|_e| "Failed to hash password")?;
 
         let key_cha = Self::key_derivation(&key, salt_enc, "header-xchacha20poly1305".as_bytes())?;
@@ -316,7 +368,9 @@ impl KeyBuilder {
     /// - `Err` if key-file access, FIDO2 interaction, password hashing, key
     ///   derivation, or cipher initialization fails
     pub fn create_body_ciphers(&mut self, salt_pw: &[u8], salt_enc: &[u8], keyfilepath: Option<&PathBuf>, salt_fido: Option<&[u8]>) -> Result<(XChaCha20Poly1305, Aes256GcmSiv)> {
-        let mut pwd = Zeroizing::new(Vec::with_capacity(self.password.expose_secret().len() + 64 + SALT_SIZE));
+        let mut pwd = Zeroizing::new(
+            Vec::with_capacity(64 + 32 + self.password.cleartext_len)
+        );
         
         if let Some(path) = keyfilepath {
             pwd.extend(
@@ -330,7 +384,7 @@ impl KeyBuilder {
             );
         }
         
-        pwd.extend(self.password.expose_secret().as_bytes());
+        pwd.extend(self.password.decrypt()?);
 
         let mut key = SecretSlice::from(vec![0u8; KEY_SIZE]);
         let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::default(), self.argon2_params.clone());
@@ -359,16 +413,35 @@ mod tests {
     use super::*;
     use std::fs;
     use aes_gcm_siv::aead::Aead;
-use rand::Rng;
+    use rand::Rng;
     use crate::{AES_NONCE_SIZE, CHA_NONCE_SIZE, SALT_SIZE};
 
     #[test]
-    fn test_get_password_from_user() {
-        let pw = KeyBuilder::get_password_from_user(false).unwrap();
-        assert_eq!("abc123test", pw.expose_secret());
+    fn test_crypt_memory() {
+        let plaintext = b"sensitive test data";
+        let mut memory = CryptMemory::new(plaintext).unwrap();
 
-        let pw = KeyBuilder::get_password_from_user(true).unwrap();
-        assert_eq!("abc123test", pw.expose_secret());
+        assert_eq!(memory.cleartext_len, plaintext.len());
+        assert_ne!(memory.data, plaintext);
+        assert_eq!(memory.decrypt().unwrap(), plaintext);
+
+        let mut empty_memory = CryptMemory::new(&[]).unwrap();
+        assert_eq!(empty_memory.cleartext_len, 0);
+        assert!(empty_memory.decrypt().unwrap().is_empty());
+
+        memory.data[0] ^= 1;
+        assert!(memory.decrypt().is_err());
+    }
+
+    #[test]
+    fn test_get_password_from_user() {
+        let mut kb = KeyBuilder::new(false);
+        kb.get_password_from_user().unwrap();
+        assert_eq!("abc123test".as_bytes(), kb.password.decrypt().unwrap());
+
+        let mut kb = KeyBuilder::new(true);
+        kb.get_password_from_user().unwrap();
+        assert_eq!("abc123test".as_bytes(), kb.password.decrypt().unwrap());
     }
 
     #[test]
@@ -464,7 +537,7 @@ use rand::Rng;
         let mut kb = KeyBuilder::new(false);
         let (cipher_cha, cipher_aes) = kb
             .get_password_and_create_header_ciphers(&salt_pw, &salt_enc).unwrap();
-        assert_eq!(kb.password.expose_secret(), "abc123test");
+        assert_eq!(kb.password.decrypt().unwrap(), "abc123test".as_bytes());
 
         // both ciphers must be able to encrypt/decrypt a message
         let nonce_cha = [0u8; CHA_NONCE_SIZE];
