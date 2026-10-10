@@ -58,7 +58,7 @@ fuzz_target!(|arb_in: FuzzInput| {
         }
     }
 
-     // add file extension of encrypted file depending on whether file should be split
+    // add file extension of encrypted file depending on whether file should be split
     let mut filepath_out = path_in.clone();
     if arb_in.split.is_empty() {
         filepath_out.add_extension(ENCRYPTED_FILE_EXT); 
@@ -74,10 +74,10 @@ fuzz_target!(|arb_in: FuzzInput| {
     }
 
     // encrypt data and decrypt its output 
-    Encryption::encrypt(&path_in, None, filepath_key.as_ref(), arb_in.compress, arb_in.split, false).unwrap();
-
-    let path_extract = base_dir.join( PathBuf::from(format!("out{:x}{:x}", random, now)) ); 
-    Decryption::decrypt(&filepath_out, Some(&path_extract), filepath_key.as_ref(), false).unwrap();
+    Encryption::encrypt(&path_in, Some(&base_dir), filepath_key.as_ref(), false, arb_in.compress, arb_in.split, false).unwrap();
+    
+    let path_extract = base_dir.join( PathBuf::from(format!("out{:x}{:x}", random, now)) );
+    Decryption::decrypt(&filepath_out, Some(&path_extract), filepath_key.as_ref(), false, false).unwrap();
 
     
     // clean up, delete files
