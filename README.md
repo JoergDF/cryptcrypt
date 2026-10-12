@@ -52,14 +52,14 @@ Arguments:
   <FILE_OR_DIRECTORY>  File that should be encrypted or decrypted. If a directory is given, its contents is archived and encrypted
 
 Options:
-  -o, --out-dir <OUT_DIR>  Output directory, it is created if it does not exist
   -d, --decrypt            Decrypt file (with extension '.cce' or for split series '.c00')
   -k, --keyfile <KEYFILE>  Additional key file to supplement the password
-  -u, --usb-key            Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
-  -z, --compress           Compress data before encryption, automatically detected on decryption
-  -s, --split <SPLIT>      Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
   -l, --list-archive       List elements of an archive file, do not create its elements
+  -o, --out-dir <OUT_DIR>  Output directory, it is created if it does not exist
+  -s, --split <SPLIT>      Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
+  -u, --usb-key            Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
   -v, --verbose            Show details about operations
+  -z, --compress           Compress data before encryption, automatically detected on decryption
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -90,6 +90,19 @@ cargo run --release
 - Encrypt a file with additional key file, compress and split output files into sizes of 1 KBytes, 2 MBytes and remaining bytes, write output files into folder `output_enc`:
   ```
   cryptcrypt -k keyfile.bin -z -s 1k,2m -o output_enc file.bin
+  ```
+
+- Encrypt a file with a USB security key. Prompts shown:
+  ```
+  cryptcrypt file.bin
+  Enter password: 
+  Repeat password: 
+  Enter PIN of USB security key: 
+  Registering USB security key...
+  - Touch the sensor on the authenticator
+  Requesting data from USB security key...
+  - Touch the sensor on the authenticator
+  USB security key end
   ```
 
 - Decrypt a file:
