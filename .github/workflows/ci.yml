@@ -32,6 +32,9 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
           key: server-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+      - if: runner.os == 'Linux'
+        name: Install additional packages
+        run: sudo apt update && sudo apt install -y libudev-dev
       - name: Build
         run: cargo build -r
       - name: Lint
