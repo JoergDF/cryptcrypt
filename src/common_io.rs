@@ -71,7 +71,7 @@ impl ReadInput {
         
         if f_in_header_size != 0 
         && f_in_total_size < f_in_header_size + (CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE) as u64 {
-            return Err("File cannot be decoded".into());
+            return Err("File cannot be decrypted".into());
         }
 
         // header was already read, therefore remaining file size must be reduced by the header's size
@@ -256,34 +256,46 @@ impl WriteFiles for WriteOutput {
     }
 }
 
+/// Shared configuration for the stream-oriented cryptographic pipeline.
+///
+/// The same config is passed to all worker threads spawned by `CryptIo::io_chunks`.
+pub struct CryptConfig {
+    /// Cipher used for the ChaCha20-Poly1305 layer.
+    pub cipher_cha: XChaCha20Poly1305,
+    /// Cipher used for the AES-256-GCM-SIV layer.
+    pub cipher_aes: Aes256GcmSiv,
+    /// Whether the payload is compressed before encryption and decompressed after decryption.
+    pub compress: bool,
+    /// Additional per-file associated data included in the authenticated chunk metadata.
+    pub more_associated_data: Vec<u8>,
+}
 
 /// Struct for common cryptographic I/O operations
 pub struct CryptIo;
 
 impl CryptIo {
-    /// Performs cryptographic I/O operations and optional compression on a file using chunked processing with multithreading.
+    /// Processes a stream of input chunks through a parallel crypto pipeline and writes the ordered output.
     ///
-    /// Reads input file in chunks, applies optional compression and two sequential cryptographic functions to each chunk
-    /// using parallelism by threads and writes the results.
+    /// `read_input` yields chunks as `(Vec<u8>, bool)`, where the boolean marks the final chunk.
+    /// Each chunk is paired with its sequence number and sent into the channel-based worker pipeline
+    /// created by `crypt_fn`. The workers are expected to return output chunks in `(Vec<u8>, u32)`
+    /// order, and the writer thread reorders them before handing them to `write_output`.
     ///
     /// # Arguments
-    /// - `cipher_cha`: cipher struct for XChaCha20-Poly1305 
-    /// - `cipher_aes`: cipher struct for AES-256-GCM-SIV 
-    /// - `compress`: Compress data before encryption, decompress after decryption
-    /// - `crypt_fn`: Cryptographic function processing compression, XChaCha20-Poly1305, AES-256-GCM-SIV
+    /// - `crypt_cfg`: Shared cryptographic state and flags for the active pipeline.
+    /// - `crypt_fn`: Function that creates the worker threads; it receives the input channel,
+    ///   output channel and CPU count and returns the join handles for the worker threads.
+    /// - `read_input`: Source providing chunked input data and thread join handling.
+    /// - `write_output`: Sink that writes ordered processed chunks and any trailing output.
     ///
     /// # Returns
-    /// - `Ok(())` on successful completion
-    /// - `Err` if file I/O fails, channels fail or cryptographic functions fail   
+    /// - `Ok(())` on successful completion.
+    /// - `Err` if an I/O error, channel error or worker panic occurs.
     #[allow(clippy::type_complexity)]
     pub fn io_chunks(
-        cipher_cha: &XChaCha20Poly1305, 
-        cipher_aes: &Aes256GcmSiv,
-        compress: bool,
+        crypt_cfg: &CryptConfig,
         crypt_fn: fn(
-            &XChaCha20Poly1305,
-            &Aes256GcmSiv,
-            bool,
+            &CryptConfig,
             Receiver<(Vec<u8>, u32, bool)>, 
             Sender<(Vec<u8>, u32)>,
             usize) -> Vec<thread::JoinHandle<std::result::Result<(), String>>>,
@@ -298,7 +310,7 @@ impl CryptIo {
         let (tx_out, rx_out) = bounded(cpu_count);
 
         // compress (optionally) and encrypt/decrypt in threads
-        let crypt_handles = crypt_fn(cipher_cha, cipher_aes, compress, rx_in, tx_out, cpu_count);
+        let crypt_handles = crypt_fn(crypt_cfg, rx_in, tx_out, cpu_count);
 
         // write output file(s) in a thread
         // chunks have to be ordered first, as durations of parallel threads varies
