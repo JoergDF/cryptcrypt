@@ -14,10 +14,6 @@ use cryptcrypt::Result;
 /// With option -s the encrypted output is split into files with extensions .c00, .c01, .c02, ...
 /// If a file ending in .c00 is decrypted, the whole split series will be read.
 struct Args {
-    /// Output directory, it is created if it does not exist
-    #[arg(short, long)]
-    out_dir: Option<PathBuf>,
-
     /// Decrypt file (with extension '.cce' or for split series '.c00')
     #[arg(short, long, default_value_t = false)]
     decrypt: bool,
@@ -26,26 +22,30 @@ struct Args {
     #[arg(short, long)]
     keyfile: Option<PathBuf>,
 
-    /// Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
-    #[arg(short, long)]
-    usb_key: bool,
+    #[arg(short, long, default_value_t = false)]
+    /// List elements of an archive file, do not create its elements
+    list_archive: bool,
 
-    /// Compress data before encryption, automatically detected on decryption
-    #[arg(short = 'z', long, default_value_t = false)]
-    compress: bool,
+    /// Output directory, it is created if it does not exist
+    #[arg(short, long)]
+    out_dir: Option<PathBuf>,
 
     /// Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
     #[arg(short, long, value_delimiter = ',', 
       value_parser = |s: &str| { let cfg = Config::new().with_binary(); cfg.parse_size(s) })]
     split: Vec<u64>,
 
-    #[arg(short, long, default_value_t = false)]
-    /// List elements of an archive file, do not create its elements
-    list_archive: bool,
-
+    /// Additional USB security key/FIDO authenticator to supplement the password, automatically detected on decryption
+    #[arg(short, long)]
+    usb_key: bool,
+    
     /// Show details about operations
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+
+    /// Compress data before encryption, automatically detected on decryption
+    #[arg(short = 'z', long, default_value_t = false)]
+    compress: bool,
 
     /// File that should be encrypted or decrypted. 
     /// If a directory is given, its contents is archived and encrypted.
