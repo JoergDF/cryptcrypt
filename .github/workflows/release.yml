@@ -25,6 +25,9 @@ jobs:
         run: rustc --version --verbose
       - name: Get cargo version
         run: cargo --version --verbose
+      - if: runner.os == 'Linux'
+        name: Install additional packages
+        run: sudo apt update && sudo apt install -y libudev-dev
       - name: Build
         run: cargo build --release
       - name: Prepare Test (Windows)
