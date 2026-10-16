@@ -619,7 +619,8 @@ impl Encryption {
             compress, 
             more_associated_data: file_id.to_vec()
         }; 
-        CryptIo::io_chunks(&crypt_cfg, Self::encrypt_pipe, read_input, write_output)?;
+        let crypt_io = CryptIo::new(build_archive && verbose);
+        crypt_io.io_chunks(&crypt_cfg, Self::encrypt_pipe, read_input, write_output)?;
         
         Ok(())
     }

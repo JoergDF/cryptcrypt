@@ -494,7 +494,8 @@ impl Decryption {
             compress: enc_header_params.compress, 
             more_associated_data: enc_header_params.file_id.to_vec()
         }; 
-        CryptIo::io_chunks(&crypt_cfg, Self::decrypt_pipe, read_input, write_output)?;
+        let crypt_io = CryptIo::new(enc_header_params.archive && (verbose || list_archive));
+        crypt_io.io_chunks(&crypt_cfg, Self::decrypt_pipe, read_input, write_output)?;
 
         Ok(())
     }

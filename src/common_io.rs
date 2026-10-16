@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
@@ -271,9 +271,16 @@ pub struct CryptConfig {
 }
 
 /// Struct for common cryptographic I/O operations
-pub struct CryptIo;
+pub struct CryptIo {
+    /// do not show progress indication
+    hide_progress_indication: bool,
+}
 
 impl CryptIo {
+    pub fn new(hide_progress_indication: bool) -> Self {
+        Self {hide_progress_indication}
+    }
+
     /// Processes a stream of input chunks through a parallel crypto pipeline and writes the ordered output.
     ///
     /// `read_input` yields chunks as `(Vec<u8>, bool)`, where the boolean marks the final chunk.
@@ -293,6 +300,7 @@ impl CryptIo {
     /// - `Err` if an I/O error, channel error or worker panic occurs.
     #[allow(clippy::type_complexity)]
     pub fn io_chunks(
+        &self,
         crypt_cfg: &CryptConfig,
         crypt_fn: fn(
             &CryptConfig,
@@ -335,8 +343,16 @@ impl CryptIo {
             (buf_in, final_chunk) = read_input.read_chunk()?;
             // don't throw error on send, otherwise errors in encryption/decryption aren't shown to user
             if tx_in.send((buf_in, chunk_count, final_chunk)).is_err() { break }
+            
+            // show progress
+            if !self.hide_progress_indication && chunk_count.is_multiple_of(256) {
+                print!(".");
+                io::stdout().flush()?;
+            }
+
             chunk_count += 1;
         }
+        println!();
 
         drop(tx_in);
 
