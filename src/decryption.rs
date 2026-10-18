@@ -485,7 +485,7 @@ impl Decryption {
             ).transpose()?;         
             Box::new( ArchiveWrite::new(dirpath_out_absolute, verbose, list_archive) )
         } else {
-            Box::new( WriteOutput::new(filepath_out, vec![])? )
+            Box::new( WriteOutput::new(filepath_out, vec![], false)? )
         };
 
         let crypt_cfg = CryptConfig {

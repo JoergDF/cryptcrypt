@@ -5,6 +5,7 @@ use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
 use chacha20poly1305::XChaCha20Poly1305;
 use aes_gcm_siv::Aes256GcmSiv;
+use sha2::{Sha256, Digest, digest::array::{Array, sizes}};
 use std::collections::HashMap;
 use num_cpus;
 
@@ -18,7 +19,7 @@ pub trait ReadChunk {
 
 pub trait WriteFiles {
     fn write_files(&mut self, buf_in: &[u8]) -> Result<()>;
-    fn write_others(&self) -> Result<()>;
+    fn write_others(&mut self) -> Result<()>;
 }
 
 /// Struct for file input
@@ -182,6 +183,12 @@ pub struct WriteOutput {
     split_index: usize,
     /// Number of written bytes of current file (required for split operation)
     f_out_write_count: u64,
+    /// Sha256 hash struct
+    hasher: Sha256,
+    /// Sha256 checksum of each output file
+    checksums: Vec<Array<u8, sizes::U32>>,
+    /// Show/hide printing of checksums for each output file
+    show_checksum: bool,
 }
 
 impl WriteOutput {
@@ -190,18 +197,21 @@ impl WriteOutput {
     /// # Arguments
     /// - `f_out_path`: File output path
     /// - `f_out_split`: Vector of split sizes for output files
+    /// - `show_checksum`: Print sha256 checksums to stdout
     ///
     /// # Returns
     /// - `Ok(Self)` on success
     /// - `Err(...)` when an I/O error occurs
-    pub fn new(f_out_path: PathBuf, f_out_split: Vec<u64>) -> Result<Self> {
+    pub fn new(f_out_path: PathBuf, f_out_split: Vec<u64>, show_checksum: bool) -> Result<Self> {
         let f_out = File::create(&f_out_path)?;
-        Ok( Self { f_out, f_out_path, f_out_split, split_index: 0, f_out_write_count: 0 } )
+        let hasher = Sha256::new();
+        Ok( Self { f_out, f_out_path, f_out_split, split_index: 0, f_out_write_count: 0, hasher, checksums: vec![], show_checksum } )
     }
 }
 
 impl WriteFiles for WriteOutput {
     /// Writes the provided buffer across one or more output files according to the configured splits.
+    /// And updates sha256 hashes for each file.
     ///
     /// - If `self.f_out_split` is empty: append the entire buffer to the current output file.
     /// - If `self.f_out_split` contains sizes: fill each target size in order, then create the next file by
@@ -213,6 +223,7 @@ impl WriteFiles for WriteOutput {
     fn write_files(&mut self, buf: &[u8]) -> Result<()> {
         if self.f_out_split.is_empty() {
             self.f_out.write_all(buf)?;
+            self.hasher.update(buf);
         } else {
             let mut buf_start: u64 = 0;
             let mut buf_end: u64   = 0;
@@ -225,10 +236,10 @@ impl WriteFiles for WriteOutput {
                     buf_start = buf_end;
 
                     // create new file
-                    let f_out_name = &mut self.f_out_path;
-                    f_out_name.set_extension(format!("c{:02}", self.split_index));
-                    self.f_out = File::create(f_out_name)?;
-                    self.f_out_write_count = 0;    
+                    self.checksums.push( self.hasher.finalize_reset() );
+                    let next_f_out_path = self.f_out_path.with_extension(format!("c{:02}", self.split_index));
+                    self.f_out = File::create(next_f_out_path)?;
+                    self.f_out_write_count = 0;
                 }
                 
                 if let Some(split_size) = self.f_out_split.get(self.split_index).copied() {
@@ -242,7 +253,8 @@ impl WriteFiles for WriteOutput {
 
                 let (s, e) = (usize::try_from(buf_start)?, usize::try_from(buf_end)?);
                 self.f_out.write_all( &buf[s..e] )?;
-                
+                self.hasher.update(&buf[s..e]);
+
                 self.f_out_write_count += buf_end - buf_start;
             }
         }
@@ -250,8 +262,28 @@ impl WriteFiles for WriteOutput {
         Ok(())
     }
 
-    fn write_others(&self) -> Result<()> {
-        // do nothing
+    /// Finalize the sha256 hashing and print its results for each file, if requested.
+    /// 
+    /// # Returns
+    /// `Ok(())` - no errors thrown
+    fn write_others(&mut self) -> Result<()> {
+        self.checksums.push( self.hasher.clone().finalize() );
+
+        if self.show_checksum {
+            println!("SHA256 checksum{}:", if self.checksums.len() > 1 {"s"} else {""});
+            for (index, checksum) in self.checksums.iter().enumerate() {
+                for byte in checksum {
+                    print!("{:02x}", byte);
+                }
+                let f_out_path =
+                if index == 0 {
+                    &self.f_out_path
+                } else {
+                    &self.f_out_path.with_extension(format!("c{:02}", index))
+                };
+                println!("  {}", f_out_path.file_name().unwrap().to_string_lossy());
+            }
+        }
         Ok(())
     }
 }
@@ -460,51 +492,78 @@ mod tests {
         
         // no split
         let split = vec![];
-        let mut wo = WriteOutput::new(f_out_path.clone(), split).unwrap();
+        let mut wo = WriteOutput::new(f_out_path.clone(), split, false).unwrap();
         wo.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums.len(), 1);
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.c00").unwrap()));
         let _ = fs::remove_file("test_split_out.c00");
+
+        // no split and .cce file
+        let mut wo = WriteOutput::new(PathBuf::from("test_split_out.cce"), vec![], false).unwrap();
+        wo.write_files(&buf).unwrap();
+        assert_eq!(fs::metadata("test_split_out.cce").unwrap().len(), 1024);
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.cce").unwrap()));
+        let _ = fs::remove_file("test_split_out.cce");
 
         // 2 split files, 1 input buffer
         let split = vec![512];
-        let mut wo = WriteOutput::new(f_out_path.clone(), split).unwrap();
+        let mut wo = WriteOutput::new(f_out_path.clone(), split, false).unwrap();
         wo.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 512);
-        assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 512);              
+        assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 512);
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.c00").unwrap()));
+        assert_eq!(wo.checksums[1], Sha256::digest(fs::read("test_split_out.c01").unwrap()));
         let _ = fs::remove_file("test_split_out.c00");
         let _ = fs::remove_file("test_split_out.c01");
 
         // 3 split files, 2 input buffers
         let split = vec![1024, 10];
-        let mut wo = WriteOutput::new(f_out_path.clone(), split).unwrap();
+        let mut wo = WriteOutput::new(f_out_path.clone(), split, false).unwrap();
         wo.write_files(&buf).unwrap();
         wo.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 10);  
-        assert_eq!(fs::metadata("test_split_out.c02").unwrap().len(), 1014);          
+        assert_eq!(fs::metadata("test_split_out.c02").unwrap().len(), 1014);
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums.len(), 3);
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.c00").unwrap()));
+        assert_eq!(wo.checksums[1], Sha256::digest(fs::read("test_split_out.c01").unwrap()));
+        assert_eq!(wo.checksums[2], Sha256::digest(fs::read("test_split_out.c02").unwrap()));
         let _ = fs::remove_file("test_split_out.c00");
         let _ = fs::remove_file("test_split_out.c01");
         let _ = fs::remove_file("test_split_out.c02");
 
         // splits same size as input buffer
         let split = vec![1024, 1024];
-        let mut wo = WriteOutput::new(f_out_path.clone(), split).unwrap();
+        let mut wo = WriteOutput::new(f_out_path.clone(), split, false).unwrap();
         wo.write_files(&buf).unwrap();
         wo.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1024);
-        assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 1024);  
-        assert!(fs::metadata("test_split_out.c02").is_err());          
+        assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 1024);
+        assert!(fs::metadata("test_split_out.c02").is_err());
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums.len(), 2);
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.c00").unwrap()));
+        assert_eq!(wo.checksums[1], Sha256::digest(fs::read("test_split_out.c01").unwrap()));
         let _ = fs::remove_file("test_split_out.c00");
         let _ = fs::remove_file("test_split_out.c01");
 
         // split sizes overflow buffer size
         let split = vec![1, 1024, 12];
-        let mut wo = WriteOutput::new(f_out_path.clone(), split).unwrap();
+        let mut wo = WriteOutput::new(f_out_path.clone(), split, false).unwrap();
         wo.write_files(&buf).unwrap();
         assert_eq!(fs::metadata("test_split_out.c00").unwrap().len(), 1);
         assert_eq!(fs::metadata("test_split_out.c01").unwrap().len(), 1023);  
         assert!(fs::metadata("test_split_out.c03").is_err()); 
-        
+        wo.write_others().unwrap(); // verify checksum
+        assert_eq!(wo.checksums.len(), 2);
+        assert_eq!(wo.checksums[0], Sha256::digest(fs::read("test_split_out.c00").unwrap()));
+        assert_eq!(wo.checksums[1], Sha256::digest(fs::read("test_split_out.c01").unwrap()));
+
         // concat output files and check against input data
         let mut f0 = File::open("test_split_out.c00").unwrap();
         let mut f1 = File::open("test_split_out.c01").unwrap();

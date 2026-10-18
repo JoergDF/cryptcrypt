@@ -594,7 +594,7 @@ impl Encryption {
         };
         
         // set write parameters and create output file
-        let mut write_output = Box::new( WriteOutput::new(filepath_out, split)? );
+        let mut write_output = Box::new( WriteOutput::new(filepath_out, split, true)? );
 
         let file_id = Self::create_file_id()?;
 

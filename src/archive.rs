@@ -1118,7 +1118,7 @@ impl WriteFiles for ArchiveWrite {
     /// # Returns
     /// - `Ok(())` on success.
     /// - `Err` if hard link creation or timestamp updates fail.
-    fn write_others(&self) -> Result<()> {
+    fn write_others(&mut self) -> Result<()> {
         // create hard links, if there are any
         for (target_path, entry_path) in &self.pending_hardlinks {
             // create directory (of hard link), if it doesn't exist
