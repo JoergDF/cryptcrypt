@@ -122,16 +122,26 @@ cargo run --release
 
 ## Encryption details
 
+**Encryption process:**  
+
+![Encryption Diagram](images/Encryption-1.drawio.png)
+
+**Data structure of encrypted output file:**  
+
+![Output Data Sequence](images/Encryption-2.drawio.png)
+
+Description:  
+
 The header of an encrypted file consists of an unencrypted part and an encrypted part:
 
-1. **Unencrypted header part:**  
+1. Unencrypted header part:  
    It contains two salts used to encrypt the second part of the header: 
    * A random salt used to create a key from the password with [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2).
    * A different random salt used to derive two keys from that password-derived key using [HKDF-SHA256](https://github.com/RustCrypto/KDFs/tree/master/hkdf). 
    These two final keys are used to encrypt the second header part with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) 
    and [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv).
 
-2. **Encrypted header part:**  
+2. Encrypted header part:  
    It contains two new salts used to encrypt the file body and additional metadata:
    * A random salt where the inputs to [Argon2id](https://github.com/RustCrypto/password-hashes/tree/master/argon2) for generating a primary key are: 
    the password, an optional USB security key's hmac-secret, and an optional key file hash.
@@ -139,7 +149,7 @@ The header of an encrypted file consists of an unencrypted part and an encrypted
    These two keys are used to encrypt the file's body with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) 
    and [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv).  
    
-   If a key file is used, its first 64 MB (maximum) is hashed with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3). If a USB security key is used, 
+   If a key file is used, its first 64 MB is hashed with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3). If a USB security key is used, 
    a credential ID and a random salt are stored and used to retrieve an hmac-secret from the key; otherwise, their space is filled with random data. Additionally, 
    the following data and flags are saved: the file format version, and flags indicating whether compression, an archive, a key file, or a USB security key is used. 
    The overall header length remains constant regardless of which options are selected.
@@ -149,11 +159,11 @@ The encryption of the file's body follows this procedure:
 1. Read a 1 MB chunk from the input file (the last chunk may be smaller). Keep a zero-based sequence number for each chunk and mark the final chunk with a flag.
 2. If compression is enabled, compress the chunk using [bzip2](https://github.com/trifectatechfoundation/bzip2-rs). Its variable-sized output is copied into fixed-size, 
 1 MB chunks. (The chunk size should not leak information about the cleartext.)
-3. **First-pass encryption:** Encrypt the chunk with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using a fresh random 
+3. First-pass encryption: Encrypt the chunk with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) using a fresh random 
 base nonce generated per chunk. The implementation derives the actual encryption nonce by XOR'ing the base nonce with the chunk's sequence number and the final-chunk flag. 
 The original base nonce is stored after the ChaCha ciphertext so the per-chunk nonce can be recomputed during decryption. Reordering or truncating the chunk sequence causes a 
 decryption error. Additional associated data (AAD) used for authentication includes: the file format version, the string "Cha", and the file ID.
-4. **Second-pass encryption:** Encrypt the output of step 3 with [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a fresh random nonce. 
+4. Second-pass encryption: Encrypt the output of step 3 with [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv) using a fresh random nonce. 
 AAD contains: the file format version, the string "Aes", the file ID, the chunk count, and the final flag. The AES nonce is stored after the AES ciphertext and written to 
 the output file.
 5. Repeat steps 1 through 4 until all input is processed.
