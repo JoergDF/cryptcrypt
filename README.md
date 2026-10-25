@@ -130,7 +130,7 @@ cargo run --release
 
 ![Output Data Sequence](images/Encryption-2.drawio.png)
 
-Description:  
+**Description:**  
 
 The header of an encrypted file consists of an unencrypted part and an encrypted part:
 
