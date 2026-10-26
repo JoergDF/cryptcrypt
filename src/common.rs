@@ -94,8 +94,8 @@ impl KeyBuilder {
             // Argon2 costs: default, faster, for testing
             argon2::Params::default()
         } else {
-            // Argon2 costs: memory: 2 GB, number of passes: 2, degree of parallelism: 1
-            argon2::Params::new(2_097_152, 2, 1 , Some(KEY_SIZE)).unwrap()
+            // Argon2 costs: memory: 2 GB, number of passes: 4, degree of parallelism: 4
+            argon2::Params::new(2_097_152, 4, 4, Some(KEY_SIZE)).unwrap()
         };
         Self { verify_password, argon2_params, ..it }
     }

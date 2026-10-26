@@ -16,6 +16,7 @@ concatenated into an archive.
 - Optional split of output into files of user-defined number and size
 - Prints SHA256 checksum for each file at end of encryption (if checksum is verified by user before decryption, 
 e.g. rollback to older backup versions by an adversary could be detected)
+- Progress indicator
 - Handles large files efficiently by parallel processing them in chunks
 - CLI interface
 - Rust toolchain
