@@ -75,6 +75,9 @@ git clone https://github.com/JoergDF/cryptcrypt.git
 cd cryptcrypt
 cargo run --release
 ```
+ If you use Visual Studio for Rust, select `clang` components for installation. And add directory of `clang-cl.exe` to the environment variable PATH: 
+ For Visual Studio 2026 Community Edition it is (on x86) `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin`
+or (on Arm64) `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\ARM64\bin`.
 
 ### Examples
 
@@ -98,7 +101,7 @@ cargo run --release
 
 - Encrypt a file with a USB security key. Prompts shown:
   ```
-  cryptcrypt file.bin
+  cryptcrypt -u file.bin
   Enter password: 
   Repeat password: 
   Enter PIN of USB security key: 
@@ -116,7 +119,7 @@ cargo run --release
   Prompts you to enter a password.  
   Creates output file `file.bin`. Overwrites file, if it already exists.
 
-- Decrypt a split series of files with additional key file (compression usage is coded in the encrypted file), write output into folder `output_dec`:
+- Decrypt a split series of files with additional key file (compression and USB security key usage are coded in the encrypted file), write output into folder `output_dec`:
   ```
   cryptcrypt -k keyfile.bin -o output_dec -d file.bin.c00
   ```
@@ -169,6 +172,9 @@ AAD contains: the file format version, the string "Aes", the file ID, the chunk 
 the output file.
 5. Repeat steps 1 through 4 until all input is processed.
 
+Keys, the password, the PIN, and the hmac-secret value are zeroized when they are no longer needed or when their memory is freed. Since the password may remain 
+in memory for a relatively long time before being used again (especially when a USB security key is used), it is temporarily encrypted using a randomly generated key. 
+These measures make it harder for an adversary to find sensitive information in a memory dump.
 
 ## License
 
