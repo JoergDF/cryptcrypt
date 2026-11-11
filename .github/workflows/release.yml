@@ -16,7 +16,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-       os: [macos-26-intel, macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+       os: [macos-26-intel, macos-latest, ubuntu-latest, ubuntu-26.04-arm, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -43,5 +43,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cryptcrypt_${{ runner.os }}_${{ runner.arch }}
-          path: target/release/cryptcrypt${{ runner.os == 'Windows' && '.exe' || '' }}
-          compression-level: 0
+          path: |
+            target/release/cryptcrypt${{ runner.os == 'Windows' && '.exe' || '' }}
+            licenses-third-party.html
+          retention-days: 1
