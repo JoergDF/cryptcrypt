@@ -1,2 +1,2 @@
-*.html linguist-generated
-*.hbs linguist-generated
+*.html -linguist-detectable
+*.hbs -linguist-detectable
