@@ -1,2 +1,2 @@
-*.html linguist-detectable=false
-*.hbs linguist-detectable=false
+*.html linguist-generated
+*.hbs linguist-generated
