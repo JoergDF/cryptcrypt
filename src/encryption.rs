@@ -1356,6 +1356,7 @@ mod tests {
         let mut filepath_out = filepath_in.clone();
         filepath_out.add_extension(ENCRYPTED_FILE_EXT);
         let filepath_kf = PathBuf::from("test_key.bin");
+        let filepath_kf_miss = PathBuf::from("test_kf_miss.bin");
         
         let mut data = vec![0; 1024 * 1024];
         rand::rng().fill_bytes(&mut data);
@@ -1376,9 +1377,14 @@ mod tests {
         // decrypt without key file
         assert!(Decryption::decrypt(&filepath_out, None, None, false, false).is_err());
 
-        // key file does not exist
-        assert!(Encryption::encrypt(&filepath_in, None, Some(&PathBuf::from("test_miss")), false, false, vec![], false).is_err());
-        assert!(Decryption::decrypt(&filepath_out, None, Some(&PathBuf::from("test_miss")), false, false).is_err());
+        // decrypt with non-existing key file
+        assert!(Decryption::decrypt(&filepath_out, None, Some(&filepath_kf_miss), false, false).is_err());
+        assert!(!fs::exists(&filepath_kf_miss).unwrap());
+        
+        // encrypt with non-existing key file
+        Encryption::encrypt(&filepath_in, None, Some(&filepath_kf_miss), false, false, vec![], false).unwrap();
+        assert!(fs::exists(&filepath_kf_miss).unwrap());
+        Decryption::decrypt(&filepath_out, None, Some(&filepath_kf_miss), false, false).unwrap();
 
         // input file does not exist
         assert!(Encryption::encrypt(&path::absolute(PathBuf::from("test_miss")).unwrap(), None, None, false, false, vec![], false).is_err());
@@ -1397,6 +1403,7 @@ mod tests {
         let _ = fs::remove_file(&filepath_in);
         let _ = fs::remove_file(&filepath_out);
         let _ = fs::remove_file(&filepath_kf);
+        let _ = fs::remove_file(&filepath_kf_miss);
     }
 
     #[test]

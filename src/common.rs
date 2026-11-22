@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::{fs::File, io::Write};
 use std::io::Read;
 use std::path::PathBuf;
 use rpassword::prompt_password;
@@ -10,6 +10,9 @@ use zeroize::{Zeroize, Zeroizing, ZeroizeOnDrop};
 use argon2::Argon2;
 use chacha20poly1305::XChaCha20Poly1305;
 use aes_gcm_siv::{Aes256GcmSiv, Nonce, KeySizeUser, aead::{Aead, Generate, Key, KeyInit}};
+use rand::{Rng, SeedableRng};
+use rand::rngs::SysRng;
+use rand_chacha::ChaCha20Rng;
 use typenum::Unsigned;
 use ctap_hid_fido2::{
     fidokey::{
@@ -150,32 +153,42 @@ impl KeyBuilder {
         Ok(pin)
     }
 
-    /// Reads and hashes a key file using SHA3-512.
+    /// Reads and hashes a key file using SHA3-512. If it does not exist, creates a random 64 MB key file 
+    /// and returns its hash.
     ///
     /// Opens the key file and reads it in chunks (up to MAX_KEYFILE_CHUNKS chunks of CHUNK_SIZE 
-    /// bytes each, i.e. max. 64 MB), updating a SHA3-512 hasher with each chunk. Returns the final 
-    /// hash as a 64-byte array. If the file is smaller than the chunk buffer, it stops reading when 
-    /// EOF is reached.
-    ///
+    /// bytes each, i.e. max. 64 MB), updating a SHA3-512 hasher with each chunk. If the file is smaller 
+    /// than the chunk buffer, it stops reading when EOF is reached.
+    /// If the key file does not exist, creates it and writes MAX_KEYFILE_CHUNKS random chunks into it, 
+    /// updating a SHA3-512 hasher with each chunk. 
+    /// Returns the final hash as a 64-byte array. 
     /// # Arguments
-    /// - `keyfilepath`: Path to the key file to read and hash
+    /// - `keyfilepath`: Path to the key file
     ///
     /// # Returns
     /// - `Ok(hash)` containing the SHA3-512 hash
-    /// - `Err` if the file cannot be opened or read
+    /// - `Err` if a file operation failed
     fn read_and_hash_keyfile(keyfilepath: &PathBuf) -> Result<[u8; 64]> {
-        let mut f_in  = File::open(keyfilepath)?;
-        let mut buf_in = vec![0u8; CHUNK_SIZE];
+        let mut buf = vec![0u8; CHUNK_SIZE];
         let mut hasher = Sha3_512::new();
-
-        let mut count_chunks = MAX_KEYFILE_CHUNKS;
-        while count_chunks > 0 {
-            let count_in = f_in.read(&mut buf_in)?;
-            if count_in == 0 { 
-                break;
+        
+        if keyfilepath.try_exists()? {
+            let mut f_in  = File::open(keyfilepath)?;
+            for _ in 0..MAX_KEYFILE_CHUNKS {
+                let count_in = f_in.read(&mut buf)?;
+                if count_in == 0 { 
+                    break;
+                }
+                hasher.update(&buf[..count_in]);
             }
-            hasher.update(&buf_in[..count_in]);
-            count_chunks -= 1;
+        } else {
+            let mut f_out = File::create(keyfilepath)?;
+            for _ in 0..MAX_KEYFILE_CHUNKS {
+                let mut rng = ChaCha20Rng::try_from_rng(&mut SysRng)?;
+                rng.fill_bytes(&mut buf);
+                f_out.write_all(&buf)?;
+                hasher.update(&buf);
+            }
         }
 
         let hash = hasher.finalize();
@@ -413,7 +426,6 @@ mod tests {
     use super::*;
     use std::fs;
     use aes_gcm_siv::aead::Aead;
-    use rand::Rng;
     use crate::{AES_NONCE_SIZE, CHA_NONCE_SIZE, SALT_SIZE};
 
     #[test]
@@ -448,6 +460,8 @@ mod tests {
     fn test_read_and_hash_keyfile() {
         // create a key file
         let filepath_kf = PathBuf::from("test_key_rh.bin");
+        let filepath_kf_miss1 = PathBuf::from("test_key_rh_miss1.bin");
+        let filepath_kf_miss2 = PathBuf::from("test_key_rh_miss2.bin");
         let mut data_kf = vec![0; 100];
         rand::rng().fill_bytes(&mut data_kf);
         fs::write(&filepath_kf, data_kf).unwrap();
@@ -473,6 +487,22 @@ mod tests {
         let hash2 = KeyBuilder::read_and_hash_keyfile(&filepath_kf).unwrap();
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, [0u8; 64]);
+        assert_eq!(hash1, [99, 156, 63, 99, 213, 86, 96, 27, 220, 11, 31, 10, 234, 101, 119, 139, 122, 
+            59, 25, 100, 123, 117, 228, 221, 221, 146, 153, 84, 180, 58, 61, 173, 179, 123, 42, 147, 174, 
+            218, 253, 180, 123, 193, 189, 243, 192, 158, 103, 106, 15, 176, 114, 190, 65, 136, 47, 76, 253,
+            38, 80, 178, 84, 31, 219, 50]);
+
+        // bigger-than-max file
+        let data_kf = vec![0xa5; (MAX_KEYFILE_CHUNKS + 1) * CHUNK_SIZE];
+        fs::write(&filepath_kf, data_kf).unwrap();
+        let hash1 = KeyBuilder::read_and_hash_keyfile(&filepath_kf).unwrap();
+        let hash2 = KeyBuilder::read_and_hash_keyfile(&filepath_kf).unwrap();
+        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, [0u8; 64]);
+        assert_eq!(hash1, [99, 156, 63, 99, 213, 86, 96, 27, 220, 11, 31, 10, 234, 101, 119, 139, 122, 
+            59, 25, 100, 123, 117, 228, 221, 221, 146, 153, 84, 180, 58, 61, 173, 179, 123, 42, 147, 174, 
+            218, 253, 180, 123, 193, 189, 243, 192, 158, 103, 106, 15, 176, 114, 190, 65, 136, 47, 76, 253,
+            38, 80, 178, 84, 31, 219, 50]);
 
         // more than chunk size
         let mut data_kf = vec![0; CHUNK_SIZE + 10];
@@ -483,11 +513,28 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, [0u8; 64]);
 
-        // key file does not exist
-        assert!(KeyBuilder::read_and_hash_keyfile(&PathBuf::from("test_miss")).is_err());
+        // key files do not exist
+        let hash1 = KeyBuilder::read_and_hash_keyfile(&filepath_kf_miss1).unwrap();
+        assert_ne!(hash1, [0u8; 64]);
+        assert!(fs::exists(&filepath_kf_miss1).unwrap());
+        assert_eq!(fs::metadata(&filepath_kf_miss1).unwrap().len(), (MAX_KEYFILE_CHUNKS * CHUNK_SIZE) as u64);
+
+        let hash2 = KeyBuilder::read_and_hash_keyfile(&filepath_kf_miss2).unwrap();
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash2, [0u8; 64]);
+        assert!(fs::exists(&filepath_kf_miss2).unwrap());
+        assert_eq!(fs::metadata(&filepath_kf_miss2).unwrap().len(), (MAX_KEYFILE_CHUNKS * CHUNK_SIZE) as u64);
+
+        // previously missing files
+        let hash3 = KeyBuilder::read_and_hash_keyfile(&filepath_kf_miss1).unwrap();
+        assert_eq!(hash1, hash3);
+        let hash4 = KeyBuilder::read_and_hash_keyfile(&filepath_kf_miss2).unwrap();
+        assert_eq!(hash2, hash4);
 
         // cleanup
         let _ = fs::remove_file(&filepath_kf);
+        let _ = fs::remove_file(&filepath_kf_miss1);
+        let _ = fs::remove_file(&filepath_kf_miss2);
     }
 
     #[test]

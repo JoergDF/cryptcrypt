@@ -429,7 +429,11 @@ impl Decryption {
 
         // check if a keyfile is required and provided by user
         if enc_header_params.keyfile && keyfilepath.is_none() {
-            return Err("Keyfile missing".into());
+            return Err("Keyfile must be specified".into());
+        } else if !enc_header_params.keyfile && keyfilepath.is_some() {
+            return Err("Keyfile not required".into());
+        } else if let Some(keyfile) = keyfilepath && !keyfile.try_exists()? {
+            return Err("Keyfile does not exist".into());
         }
 
         // check for usb key/FIFO authenticator

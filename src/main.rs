@@ -18,7 +18,7 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     decrypt: bool,
 
-    /// Additional key file to supplement the password
+    /// Additional key file to supplement the password; if it does not exist, it is created
     #[arg(short, long)]
     keyfile: Option<PathBuf>,
 
@@ -77,7 +77,7 @@ fn run() -> Result<()> {
     let args = Args::parse();
 
     let filepath = args.file_or_directory.canonicalize()?;
-    let keyfilepath = args.keyfile.map(|keyf| keyf.canonicalize()).transpose()?;
+    let keyfilepath = args.keyfile.map(path::absolute).transpose()?;
     let output_dir = args.out_dir.map(path::absolute).transpose()?;
 
     if args.decrypt {

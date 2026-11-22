@@ -1,8 +1,6 @@
 # cryptcrypt
 
-A command-line tool for encrypting and decrypting a file or a directory using modern encryption algorithms and password-based key derivation.
-Additionally, it can use a USB security key, a key file, bzip2 compression and an output file split. The contents of a directory are 
-concatenated into an archive.
+A command-line tool for encrypting and decrypting a file or a directory using modern encryption algorithms and password-based key derivation. Additionally, it can use a USB security key, a key file, bzip2 compression and an output file split. The contents of a directory are concatenated into an archive.
 
 **Security Notes**: This software is experimental. There wasn't any security audit. Do not use in production. USE AT YOUR OWN RISK!
 
@@ -57,7 +55,7 @@ Arguments:
 
 Options:
   -d, --decrypt            Decrypt file (with extension '.cce' or for split series '.c00')
-  -k, --keyfile <KEYFILE>  Additional key file to supplement the password
+  -k, --keyfile <KEYFILE>  Additional key file to supplement the password; if it does not exist, it is created
   -l, --list-archive       List elements of an archive file, do not create its elements
   -o, --out-dir <OUT_DIR>  Output directory, it is created if it does not exist
   -s, --split <SPLIT>      Split encrypted data into pieces of binary byte sizes (e.g. 2g,3g,1g) [G|g|M|m|K|k]
@@ -68,16 +66,21 @@ Options:
   -V, --version            Print version
 ```
 
-### Build/Run from Source
+### Build from source
 
 ```shell
 git clone https://github.com/JoergDF/cryptcrypt.git
 cd cryptcrypt
-cargo run --release
+cargo build --release
 ```
- If you use Visual Studio for Rust, select `clang` components for installation. And add directory of `clang-cl.exe` to the environment variable PATH: 
- For Visual Studio 2026 Community Edition it is (on x86) `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin`
+If you use Visual Studio for Rust, select `clang` components for installation. And add directory of `clang-cl.exe` to the environment variable PATH: 
+For Visual Studio 2026 Community Edition it is (on x86) `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin`
 or (on Arm64) `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\ARM64\bin`.
+
+#### Create third-party license file
+```
+cargo about generate about.hbs > licenses-third-party.html
+```
 
 ### Examples
 
@@ -153,7 +156,8 @@ The header of an encrypted file consists of an unencrypted part and an encrypted
    These two keys are used to encrypt the file's body with [XChaCha20-Poly1305](https://github.com/RustCrypto/AEADs/tree/master/chacha20poly1305) 
    and [AES-256-GCM-SIV](https://github.com/RustCrypto/AEADs/tree/master/aes-gcm-siv).  
    
-   If a key file is used, its first 64 MB is hashed with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3). If a USB security key is used, 
+   If a key file is used, its first 64 MB is hashed with [sha3-512](https://github.com/RustCrypto/hashes/tree/master/sha3). 
+   A key file with 64 MB random bytes is created, if the provided filename does not exist. If a USB security key is used, 
    a credential ID and a random salt are stored and used to retrieve an hmac-secret from the key; otherwise, their space is filled with random data. Additionally, 
    the following data and flags are saved: the file format version, and flags indicating whether compression, an archive, a key file, or a USB security key is used. 
    The overall header length remains constant regardless of which options are selected.
