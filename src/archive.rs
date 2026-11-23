@@ -8,7 +8,6 @@ use typed_path::Utf8WindowsPath;
 use walkdir::{DirEntry, WalkDir};
 use crossbeam_channel::{Receiver, Select, TryRecvError, bounded};
 use num_cpus;
-use filetime;
 use std::collections::HashMap;
 use drill_press::{SegmentType, Segment, Segments, SparseFile};
 use chrono::{prelude::*, DateTime};
@@ -951,11 +950,7 @@ impl ArchiveWrite {
             }
 
             // set timestamps of symlink
-            match filetime::set_symlink_file_times(
-                &hdr.entry_path,
-                filetime::FileTime::from_system_time(hdr.time_accessed),    
-                filetime::FileTime::from_system_time(hdr.time_modified)
-            ) {
+            match fs::set_times_nofollow(&hdr.entry_path, self.file_times) {
                 Ok(()) => {},
                 Err(e) => eprintln!("Could not set original timestamps for symlink {}: {e}", hdr.entry_path.display()),
             }
@@ -1129,12 +1124,10 @@ impl WriteFiles for ArchiveWrite {
         // need to be done after all elements have been created, as creation of an element
         // updates timestamp of its parent directory to now
         for (dir_path, atime, mtime) in &self.dir_times {
-            // supports Windows and Unix
-            match filetime::set_file_times(
-                dir_path,
-                filetime::FileTime::from_system_time(*atime),
-                filetime::FileTime::from_system_time(*mtime)
-            ) {
+            let times = FileTimes::new()
+                .set_accessed(*atime)
+                .set_modified(*mtime);
+            match fs::set_times(dir_path, times) {
                 Ok(()) => {},
                 Err(e) => eprintln!("Could not set original timestamps for directory {}: {e}", dir_path.display()),
             };
@@ -1303,30 +1296,29 @@ mod tests {
         }
 
         // Set modified time of file1
-        filetime::set_file_mtime(
-            &file1_path,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2000))
-        ).unwrap();
-        
-        // Set modified time of empty file
-        filetime::set_file_mtime(
-            &empty_file_path,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(3000))
-        ).unwrap();
-        
-        // Set modified time of symlink
-        filetime::set_file_mtime(
-            &symlink_path,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(4444))   
-        ).unwrap();
-        
-        // Set modified time of subdirectory
-        filetime::set_file_mtime(
-            &sub_dir,
-            filetime::FileTime::from_system_time(UNIX_EPOCH + Duration::from_secs(2222))
+        fs::set_times(
+            &file1_path, 
+            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(2000))
         ).unwrap();
 
-  
+        // Set modified time of empty file
+        fs::set_times(
+            &empty_file_path, 
+            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(3000))
+        ).unwrap();
+
+        // Set modified time of symlink
+        fs::set_times_nofollow(
+            &symlink_path, 
+            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(4444))
+        ).unwrap();
+
+        // Set modified time of subdirectory
+        fs::set_times(
+            &sub_dir, 
+            FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(2222))
+        ).unwrap();
+
         // Get modified time of file1
         let meta_orig1 = fs::metadata(&file1_path).unwrap();
         let modified_orig1 = meta_orig1.modified().unwrap();
