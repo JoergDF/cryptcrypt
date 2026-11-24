@@ -25,6 +25,8 @@ jobs:
         run: rustc --version --verbose
       - name: Get cargo version
         run: cargo --version --verbose
+      - name: Update rust
+        run: rustup update stable
       - if: runner.os == 'Linux'
         name: Install additional packages
         run: sudo apt update && sudo apt install -y libudev-dev
