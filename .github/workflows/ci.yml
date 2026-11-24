@@ -17,7 +17,7 @@ jobs:
       contents: read
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-26-intel, macos-latest, ubuntu-latest, ubuntu-26.04-arm, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -26,6 +26,8 @@ jobs:
         run: rustc --version --verbose
       - name: Get cargo version
         run: cargo --version --verbose
+      - name: Update rust
+        run: rustup update stable
       - uses: actions/cache@v5
         with:
           path: |
