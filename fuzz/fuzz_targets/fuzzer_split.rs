@@ -28,7 +28,7 @@ fuzz_target!(|input: (&[u8], Vec<u16>)| {
 
     // write data into split files
     let split_u64: Vec<u64> = split.iter().map(|x| {*x as u64}).collect();
-    let mut wr = common_io::WriteOutput::new(filepath.clone(), split_u64).unwrap();
+    let mut wr = common_io::WriteOutput::new(filepath.clone(), split_u64, false).unwrap();
     wr.write_files(&[0]).unwrap(); // header
     wr.write_files(&data).unwrap();
     wr.write_files(&[0; CHA_NONCE_SIZE + CHA_TAG_SIZE + AES_NONCE_SIZE + AES_TAG_SIZE]).unwrap();

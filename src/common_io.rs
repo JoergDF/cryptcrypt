@@ -205,6 +205,11 @@ impl WriteOutput {
     pub fn new(f_out_path: PathBuf, f_out_split: Vec<u64>, show_checksum: bool) -> Result<Self> {
         let f_out = File::create(&f_out_path)?;
         let hasher = Sha256::new();
+        let show_checksum = if cfg!(fuzzing) {
+            false 
+        } else {
+            show_checksum
+        };
         Ok( Self { f_out, f_out_path, f_out_split, split_index: 0, f_out_write_count: 0, hasher, checksums: vec![], show_checksum } )
     }
 }
@@ -310,6 +315,11 @@ pub struct CryptIo {
 
 impl CryptIo {
     pub fn new(hide_progress_indication: bool) -> Self {
+        let hide_progress_indication = if cfg!(fuzzing) {
+            true
+        } else {
+            hide_progress_indication
+        };
         Self {hide_progress_indication}
     }
 
@@ -384,7 +394,9 @@ impl CryptIo {
 
             chunk_count += 1;
         }
-        println!();
+        if !self.hide_progress_indication {
+            println!();
+        }
 
         drop(tx_in);
 
