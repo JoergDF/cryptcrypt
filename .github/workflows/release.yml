@@ -15,6 +15,7 @@ jobs:
     permissions:
       contents: read
     strategy:
+      fail-fast: false
       matrix:
        os: [macos-26-intel, macos-latest, ubuntu-latest, ubuntu-26.04-arm, windows-latest, windows-11-arm]
     runs-on: ${{ matrix.os }}
