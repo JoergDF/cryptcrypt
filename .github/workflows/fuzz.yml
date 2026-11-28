@@ -32,6 +32,8 @@ jobs:
               run: rustc --version --verbose
             - name: Get cargo version
               run: cargo --version --verbose
+            - name: Install additional packages for Linux
+              run: sudo apt update && sudo apt install -y libudev-dev
             - name: Install fuzzer
               run: cargo install cargo-fuzz
             - name: Run fuzzer 
