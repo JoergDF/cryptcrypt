@@ -5,7 +5,7 @@ use libfuzzer_sys::fuzz_target;
 use rand::Rng;
 use rand::RngExt;
 use std::path::PathBuf;
-use std::fs;
+use std::{fs, env};
 use std::time::SystemTime;
 use glob::glob;
 use cryptcrypt::encryption::Encryption;
@@ -22,15 +22,20 @@ struct FuzzInput {
     split: Vec<u64>,
 }
 
-// directory for temporary input/output files and keyfile (could be a RAM disk)
-const DATA_PATH: &str = "/Volumes/RAMDisk1GB/";
+// environment variable with a directory name for temporary input/output files (could be a RAM disk)
+const ENV_TEMP: &str = "FUZZ_TEMP_DIR";
 
 // fuzzing of encryption and decryption (with optional compression)
 //
 // input data is written to files hence encryption can read it from there,
 // output data is read from files which are written by decryption
 fuzz_target!(|arb_in: FuzzInput| {
-    let base_dir = PathBuf::from(DATA_PATH);
+    
+    let temp_dir = match env::var(ENV_TEMP) {
+        Ok(val) => val + "/",
+        Err(_) => "./".to_string()
+    };
+    let base_dir = PathBuf::from(&temp_dir).canonicalize().unwrap();
 
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
     let random: u32 = rand::rng().random();  
@@ -81,7 +86,7 @@ fuzz_target!(|arb_in: FuzzInput| {
 
     
     // clean up, delete files
-    for file in glob(format!("{DATA_PATH}*{:x}{:x}*", random, now).as_str()).unwrap() {
+    for file in glob(format!("{}*{:x}{:x}*", temp_dir, random, now).as_str()).unwrap() {
         let _ = fs::remove_file(&file.unwrap());
     }
     let _ = fs::remove_dir_all(&path_in);

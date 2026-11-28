@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use std::path::PathBuf;
-use std::fs;
+use std::{fs, env};
 use rand::RngExt;
 use std::time::SystemTime;
 use glob::glob;
@@ -12,8 +12,8 @@ use cryptcrypt::common_io::ReadChunk;
 use cryptcrypt::{AES_NONCE_SIZE, AES_TAG_SIZE, CHA_NONCE_SIZE, CHA_TAG_SIZE, SPLIT_ENC_FILE_EXT};
 
 
-// directory for temporary input/output files (could be a RAM disk)
-const DATA_PATH: &str = "/Volumes/RAMDisk1GB/";
+// environment variable with a directory name for temporary input/output files (could be a RAM disk)
+const ENV_TEMP: &str = "FUZZ_TEMP_DIR";
 
 // fuzzing of split algorithm (without encryption, decryption, compression)
 //
@@ -21,9 +21,13 @@ const DATA_PATH: &str = "/Volumes/RAMDisk1GB/";
 fuzz_target!(|input: (&[u8], Vec<u16>)| {
     let (data, split) = input;
     
+    let temp_dir = match env::var(ENV_TEMP) {
+        Ok(val) => val + "/",
+        Err(_) => "./".to_string()
+    };
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
     let random: u32 = rand::rng().random();
-    let mut filepath = PathBuf::from(format!("{DATA_PATH}dat{:x}{:x}", random, now));     
+    let mut filepath = PathBuf::from(format!("{}dat{:x}{:x}", temp_dir, random, now));     
     filepath.add_extension(SPLIT_ENC_FILE_EXT);
 
     // write data into split files
@@ -53,7 +57,7 @@ fuzz_target!(|input: (&[u8], Vec<u16>)| {
     assert_eq!(data, data_out);
 
     // delete files
-    for file in glob(format!("{DATA_PATH}*{:x}{:x}*", random, now).as_str()).unwrap() {
+    for file in glob(format!("{}*{:x}{:x}*", temp_dir, random, now).as_str()).unwrap() {
         let _ = fs::remove_file(&file.unwrap());
     }
 });
