@@ -32,9 +32,10 @@ jobs:
               run: rustc --version --verbose
             - name: Get cargo version
               run: cargo --version --verbose
+            - name: Install fuzzer
+              run: cargo install cargo-fuzz
             - name: Run fuzzer 
               run: |
                 # Run for 60s on PRs, 10 minutes on scheduled runs
                 DURATION=${{ github.event_name == 'schedule' && '600' || '60' }} 
                 cargo fuzz run ${{ matrix.target }} -- -max_total_time=$DURATION
-                
